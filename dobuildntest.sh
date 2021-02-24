@@ -49,6 +49,7 @@ set -e
 run_prep=1
 run_clean=0
 run_build=0
+run_package_gen=0
 run_unit_tests=0
 run_code_violation=0
 run_code_coverage=0
@@ -83,12 +84,18 @@ function pre_exit {
     summaryFile=${outputFolder}/summary.txt
 
     if [[ -f ${summaryFile} ]]; then
-       echo -e "----------------------------------------------------------------------------------------------------------\n" | tee -a ${summaryFile}
-       echo -e "\nResults are in location:\n${outputFolder}\n" | tee -a ${summaryFile}
-       cat ${summaryFile}
-       if grep -q FAIL "${summaryFile}"; then
-           EXIT_CODE=3
-       fi
+        # In case there is non-zero exit code, then add a FAILED tag to the summary file.
+        if [ $EXIT_CODE -ne 0 ]; then
+            echo -e "One or more Stages \t\t FAILED " | tee -a ${outputFolder}/summary.txt
+        fi
+
+        echo -e "----------------------------------------------------------------------------------------------------------\n" |tee -a ${summaryFile}
+        echo -e "\nResults are in location:\n${outputFolder}\n" | tee -a ${summaryFile}
+        cat ${summaryFile}
+
+        if grep -q FAIL "${summaryFile}"; then
+            EXIT_CODE=3
+        fi
     fi
 
     # Return the exit code
@@ -120,6 +127,7 @@ usage() {
   echo -e "NOTE: This script must be executed within the docker container (or in a machine with all dependencies installed). It will NOT start a docker container.\n"
   echo "${0} [-o <output_folder>]"
   echo "    -b --> build the code"
+  echo "    -p --> generate pip packages"
   echo "    -u --> run unit tests"
   echo "    -v --> run code violation checks (using pylint tool)"
   echo "    -g --> run code coverage checks (using pycov tool)"
@@ -129,7 +137,7 @@ usage() {
   echo "    -w --> path to AIMET workspace. Default is current directory"
 }
 
-while getopts "o:w:abcghsuv" opt;
+while getopts "o:w:abcghpsuv" opt;
    do
       case $opt in
          a)
@@ -143,6 +151,9 @@ while getopts "o:w:abcghsuv" opt;
              ;;
          g)
              run_code_coverage=1
+             ;;
+         p)
+             run_package_gen=1
              ;;
          u)
              run_unit_tests=1
@@ -174,13 +185,14 @@ while getopts "o:w:abcghsuv" opt;
       esac
 done
 
-# If no modes are enabled by user, then enable all modes by default
+# If no modes are enabled by user, then enable most modes by default
 if [ $run_clean -eq 0 ] && [ $run_acceptance_tests -eq 0 ] && [ $run_build -eq 0 ] && \
     [ $run_unit_tests -eq 0 ] && [ $run_code_violation -eq 0 ] && [ $run_code_coverage -eq 0 ] && \
     [ $run_static_analysis -eq 0 ]; then
     run_prep=1
     run_clean=1
     run_build=1
+    run_package_gen=0
     run_unit_tests=1
     run_code_violation=1
     run_code_coverage=1
@@ -243,7 +255,8 @@ if [ $run_prep -eq 1 ]; then
     ## wget -N https://download.pytorch.org/models/inception_v3_google-1a9a5a14.pth -P ${AIMET_TORCH_HOME}/checkpoints
 
     # Clone the google test repo if not already present
-    if [ ! -d $workspaceFolder/ThirdParty/googletest/googletest-release-1.8.0 ]; then
+    google_test_path="${workspaceFolder}/ThirdParty/googletest/googletest-release-1.8.0"
+    if [ ! -e ${google_test_path} ]; then
         mkdir -p $workspaceFolder/ThirdParty/googletest
         pushd $workspaceFolder/ThirdParty/googletest
         git clone https://github.com/google/googletest.git -b release-1.8.0 googletest-release-1.8.0
@@ -252,9 +265,28 @@ if [ $run_prep -eq 1 ]; then
     fi
 
     # Array of python src file path endings
-    declare -a python_src_path_endings=("TrainingExtensions/tensorflow/src/python/aimet_tensorflow"
-        "TrainingExtensions/torch/src/python/aimet_torch"
-        "TrainingExtensions/common/src/python/aimet_common")
+    declare -a python_src_path_endings=("TrainingExtensions/common/src/python/aimet_common")
+    # Array of path endings of interest for code coverage and their corresponding test folders
+    declare -a pycov_dir_endings=("TrainingExtensions/common/src/python:TrainingExtensions/common/test")
+
+    if [ -n "$AIMET_VARIANT" ]; then
+        # Add tensorflow and/or torch paths based on the variant
+        if [[ "$AIMET_VARIANT" == *"tf"* ]]; then
+            python_src_path_endings+=("TrainingExtensions/tensorflow/src/python/aimet_tensorflow")
+            pycov_dir_endings+=("TrainingExtensions/tensorflow/src/python:TrainingExtensions/tensorflow/test")
+        fi
+        if [[ "$AIMET_VARIANT" == *"torch"* ]]; then
+            python_src_path_endings+=("TrainingExtensions/torch/src/python/aimet_torch")
+            pycov_dir_endings+=("TrainingExtensions/torch/src/python:TrainingExtensions/torch/test")
+        fi
+    else
+        # For default variant, add both tensorflow and/or torch paths
+        python_src_path_endings+=("TrainingExtensions/tensorflow/src/python/aimet_tensorflow")
+        pycov_dir_endings+=("TrainingExtensions/tensorflow/src/python:TrainingExtensions/tensorflow/test")
+
+        python_src_path_endings+=("TrainingExtensions/torch/src/python/aimet_torch")
+        pycov_dir_endings+=("TrainingExtensions/torch/src/python:TrainingExtensions/torch/test")
+    fi
 
     # Populate an array of python src paths for use in later stages
     for python_src_path_ending in "${python_src_path_endings[@]}"; do
@@ -275,10 +307,6 @@ if [ $run_prep -eq 1 ]; then
     done
     echo "PYTHONPATH value = $PYTHONPATH_VALUE"
 
-    # list of path endings of interest for code coverage and their corresponding test folders
-    pycov_dir_endings=("TrainingExtensions/tensorflow/src/python:TrainingExtensions/tensorflow/test"
-                   "TrainingExtensions/torch/src/python:TrainingExtensions/torch/test" 
-                   "TrainingExtensions/common/src/python:TrainingExtensions/common/test")
     # Loop over the directory endings
     for pycov_dir_ending in "${pycov_dir_endings[@]}"; do
         pycov_src_path_ending=${pycov_dir_ending%%:*}
@@ -301,12 +329,54 @@ if [ $run_build -eq 1 ]; then
 
     mkdir -p build
     cd build
+
+    extra_opts=""
+    if [ -n "$SW_VERSION" ]; then
+        extra_opts+=" -DSW_VERSION=${SW_VERSION}"
+    fi
+    # Add build options based on variant
+    if [ -n "$AIMET_VARIANT" ]; then
+        if [[ "$AIMET_VARIANT" == *"gpu"* ]]; then
+            extra_opts+=" -DENABLE_CUDA=ON"
+        fi
+        if [[ "$AIMET_VARIANT" == *"cpu"* ]]; then
+            extra_opts+=" -DENABLE_CUDA=OFF"
+        fi
+        if [[ "$AIMET_VARIANT" == *"tf"* ]]; then
+            extra_opts+=" -DENABLE_TENSORFLOW=ON"
+        fi
+        if [[ "$AIMET_VARIANT" == *"torch"* ]]; then
+            extra_opts+=" -DENABLE_TORCH=ON"
+        fi
+        if [[ "$AIMET_VARIANT" != *"tf"* ]]; then
+            extra_opts+=" -DENABLE_TENSORFLOW=OFF"
+        fi
+        if [[ "$AIMET_VARIANT" != *"torch"* ]]; then
+            extra_opts+=" -DENABLE_TORCH=OFF"
+        fi
+    fi
     # Do not exit on failure by default from this point forward
     set +e
-    cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ..
+    cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ${extra_opts} ..
 
     make -j 8
     check_stage $? "Build" "true"
+
+    echo -e "\n********** Stage 2a: Generate Docs **********\n"
+    make doc
+    check_stage $? "Generate Doc" "true"
+fi
+
+if [ $run_package_gen -eq 1 ]; then
+    cd build
+
+    echo -e "\n********** Stage 2b: Install **********\n"
+    make install
+    check_stage $? "Install" "true"
+
+    echo -e "\n********** Stage 2c: Package **********\n"
+    make packageaimet
+    check_stage $? "Package" "true"
 fi
 
 if [ $run_unit_tests -eq 1 ]; then
@@ -344,6 +414,7 @@ if [ $run_code_violation -eq 1 ]; then
 
         LD_LIBRARY_PATH=$artifactsFolder:$LD_LIBRARY_PATH \
         PYTHONPATH=$PYTHONPATH_VALUE \
+        PYLINTHOME=${buildFolder} \
         pylint --rcfile=${workspaceFolder}/.pylintrc -r n --msg-template='{path}:{line}: [{msg_id}({symbol}), {obj}] {msg}' ${python_src_path} 2>&1 \
         | tee ${pylint_results_dir}/${pylint_results_file_name}
         code_violation_result=$?
@@ -364,16 +435,17 @@ if [ $run_static_analysis -eq 1 ]; then
     static_analysis_result=0
     clangtidy_results_dir=$outputFolder
     mkdir -p ${clangtidy_results_dir}
-    cd $workspaceFolder/build; python2.7 /usr/bin/run-clang-tidy.py >| ${clangtidy_results_dir}/clang-tidy_results.out
+    #TODO: Do not fail from the static analysis command since there are many unresolved errors
+    set +e
+    cd $workspaceFolder/build; python3 /usr/bin/run-clang-tidy.py >| ${clangtidy_results_dir}/clang-tidy_results.out
     static_analysis_result=$?
-    if [ $static_analysis_result -eq 0 ]; then
-        if grep -q "error:" "${clangtidy_results_dir}/clang-tidy_results.out"; then
-            #Let static analysis pass for warnings, uncomment next line to enfore analysis again
-            #static_analysis_result=1
-            echo -e "\n********** Static analysis results START **********\n"
-            cat ${clangtidy_results_dir}/clang-tidy_results.out
-            echo -e "\n********** Static analysis results END **********\n"
-        fi
+    set -e
+    # Check for errors in static analysis log file and if found, display the log.
+    if grep -q "error:" "${clangtidy_results_dir}/clang-tidy_results.out"; then
+        static_analysis_result=1
+        echo -e "\n********** Static analysis results START **********\n"
+        cat ${clangtidy_results_dir}/clang-tidy_results.out
+        echo -e "\n********** Static analysis results END **********\n"
     fi
     check_stage $static_analysis_result "Static analysis" "false"
 fi
@@ -420,6 +492,7 @@ if [ $run_code_coverage -eq 1 ]; then
     check_stage $coverage_test_rc "Code coverage" "false"
 fi
 
+echo -e "\n outputFolder = ${outputFolder}"
 if grep -q FAIL "${outputFolder}/summary.txt"; then
     EXIT_CODE=3
 fi

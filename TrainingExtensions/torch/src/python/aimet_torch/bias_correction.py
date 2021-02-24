@@ -182,7 +182,7 @@ def call_analytical_mo_correct_bias(layer: torch.nn.Module, bn: Union[torch.nn.B
     weight_tensor = layer._module_to_wrap.weight
 
     # Transpose weights to C, N, H, W from N, C, H, W since axis are flipped for transposed conv
-    if isinstance(layer._module_to_wrap, torch.nn.ConvTranspose2d):
+    if isinstance(layer._module_to_wrap, torch.nn.ConvTranspose2d) and layer._module_to_wrap.groups == 1:
         weight_tensor = weight_tensor.permute(1, 0, 2, 3)
         quant_dequant_weight = quant_dequant_weight.permute(1, 0, 2, 3)
 
@@ -281,12 +281,15 @@ def correct_bias(model: torch.nn.Module, quant_params: qsim.QuantParams,
             module.bias.data = module.bias.data.to(device=module.weight.device)
 
     # Quantize full model
+    dummy_tensors = utils.create_rand_tensors_given_shapes(input_shape)
+    dummy_tensors = [tensor.to(utils.get_device(model)) for tensor in dummy_tensors]
     q = qsim.QuantizationSimModel(model=model, quant_scheme=quant_params.quant_scheme,
                                   rounding_mode=quant_params.round_mode,
                                   default_output_bw=quant_params.act_bw,
                                   default_param_bw=quant_params.weight_bw,
                                   in_place=True,
-                                  input_shapes=input_shape)
+                                  dummy_input=dummy_tensors, config_file=quant_params.config_file)
+
     # make sure  model got updated in-place before we use it for bc updates
     assert(q.model is model)
 
@@ -294,7 +297,7 @@ def correct_bias(model: torch.nn.Module, quant_params: qsim.QuantParams,
     for name, module in model.named_modules():
         # Skip all layer's output quantization
         if isinstance(module, QcQuantizeWrapper):
-            module.output_quantizer.enabled = False
+            module.output_quantizers[0].enabled = False
 
     q.compute_encodings(pass_data_through_model, None)
 

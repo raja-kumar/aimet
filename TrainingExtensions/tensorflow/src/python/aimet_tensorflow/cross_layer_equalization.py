@@ -73,7 +73,7 @@ class GraphSearchUtils:
 
         self._connected_graph = ConnectedGraph(model, start_op_names, output_op_names)
 
-    def find_and_replace_relu6_with_relu(self, sess: tf.Session) -> tf.Session:
+    def find_and_replace_relu6_with_relu(self, sess: tf.compat.v1.Session) -> tf.compat.v1.Session:
         """
         finds and replaces Relu6 ops with Relu
         :return: updated session
@@ -113,7 +113,7 @@ class GraphSearchUtils:
             current_group.append(op)
 
         # Terminating condition for current group
-        if not (op.type in ['Conv2D', 'DepthwiseConv2dNative', 'Relu', 'Pad', 'Identity']):
+        if not (op.type in ['Conv2D', 'DepthwiseConv2dNative', 'Relu', 'PReLU', 'Pad', 'Identity']):
             if (len(current_group) > 1) and (current_group not in layer_groups):
                 layer_groups.append(current_group)
                 node_set = [op.dotted_name for op in current_group]
@@ -158,9 +158,9 @@ class GraphSearchUtils:
         """
 
         layer_groups_as_conn_graph_ops = self.find_layer_groups_to_scale_as_conn_ops()
-        layer_groups_as_tf_ops = self.convert_conn_graph_ops_to_tf_op(layer_groups_as_conn_graph_ops)
+        layer_groups_as_tf_ops, tf_op_to_conn_graph_op_map = self.convert_conn_graph_ops_to_tf_op(layer_groups_as_conn_graph_ops)
 
-        return layer_groups_as_tf_ops
+        return tf_op_to_conn_graph_op_map, layer_groups_as_tf_ops
 
     @staticmethod
     def convert_conn_graph_ops_to_tf_op(op_groups: List[List[Op]]) -> \
@@ -171,14 +171,16 @@ class GraphSearchUtils:
         :param op_groups: list of op groups as TfOperation type of used by Connected Graph
         :return: lis of op groups as tf.Operation  (standard TF op type)
         """
+        tf_op_to_conn_graph_op_map = {}
         layer_groups_as_tf_ops = []
         for ops in op_groups:
             curr_group = []
             for op in ops:
+                tf_op_to_conn_graph_op_map[op.get_module()] = op
                 curr_group.append(op.get_module())
             layer_groups_as_tf_ops.append(curr_group)
 
-        return layer_groups_as_tf_ops
+        return layer_groups_as_tf_ops, tf_op_to_conn_graph_op_map
 
     @staticmethod
     def convert_layer_group_to_cls_sets(layer_group):
@@ -205,10 +207,12 @@ class GraphSearchUtils:
         return cls_sets
 
     @staticmethod
-    def is_relu_activation_present_in_cls_sets(cls_sets: List[ClsSet]) -> List[bool]:
+    def is_relu_activation_present_in_cls_sets(cls_sets: List[ClsSet],
+                                               tf_op_to_conn_graph_op_map: Dict) -> List[bool]:
         """
         check if there is Relu activations between cls sets
         :param cls_sets: cls conv op pairs
+        :param tf_op_to_conn_graph_op_map: Map of tf-op => connected graph op
         :return: list of relu activation preset flags(True or False)
         corresponding to input cls_sets list
         """
@@ -220,7 +224,8 @@ class GraphSearchUtils:
 
             is_relu_activation_in_cls_set = ()
             for conv_op in cls_set:
-                is_relu_activation_in_cls_set += (ReluUtils.does_conv_have_relu_activation(conv_op), )
+                conn_graph_conv_op = tf_op_to_conn_graph_op_map[conv_op]
+                is_relu_activation_in_cls_set += (ReluUtils.does_conv_have_relu_activation(conn_graph_conv_op), )
 
             if len(is_relu_activation_in_cls_set) == 1:
                 is_relu_activation_in_cls_set = is_relu_activation_in_cls_set[0]
@@ -230,12 +235,12 @@ class GraphSearchUtils:
         return is_relu_activation_in_cls_sets
 
     @staticmethod
-    def map_op_names_to_ops(sess: tf.Session) -> Dict[str, tf.Operation]:
+    def map_op_names_to_ops(sess: tf.compat.v1.Session) -> Dict[str, tf.Operation]:
         """
         After the fold and cls , the graph is updated, so are the ops
         So, we need a way to map ops we stored on graph we began with, to perform
         high bias fold operation on latest ops in the updated graph.
-        :param sess: active TF session (tf.Session type)
+        :param sess: active tf.compat.v1.Session (tf.compat.v1.Session type)
         :return: a dictionary of op names mapped to ops in the given new session.
         Note : only stores infor pertaining to bn and conv ops required by high bias fold.
         """
@@ -302,7 +307,7 @@ class CrossLayerScaling:
     """ implements auto mode cross-layer-scaling technique to a model """
 
     @staticmethod
-    def scale_cls_sets(sess: tf.Session, cls_sets: List[ClsSet]) -> List[ScaleFactor]:
+    def scale_cls_sets(sess: tf.compat.v1.Session, cls_sets: List[ClsSet]) -> List[ScaleFactor]:
 
         """
         Scale multiple CLS sets
@@ -319,7 +324,7 @@ class CrossLayerScaling:
         return scale_factor_list
 
     @staticmethod
-    def scale_cls_set(sess: tf.Session, cls_set: ClsSet) -> ScaleFactor:
+    def scale_cls_set(sess: tf.compat.v1.Session, cls_set: ClsSet) -> ScaleFactor:
         """
         Scale a CLS set
         :param sess: Current session
@@ -335,10 +340,10 @@ class CrossLayerScaling:
         return scale_factor
 
     @staticmethod
-    def scale_cls_set_with_conv_layers(model: tf.Session, cls_set: Tuple[tf.Operation, tf.Operation]) -> np.ndarray:
+    def scale_cls_set_with_conv_layers(model: tf.compat.v1.Session, cls_set: Tuple[tf.Operation, tf.Operation]) -> np.ndarray:
         """
         API to invoke equalize layer params (update for weights and bias is in place)
-        :param model: active TF session
+        :param model: active tf.compat.v1.Session
         :param cls_set: Consecutive Conv layers Tuple whose weights and biases need to be equalized
         :return: Scaling factor S_12 for each conv layer pair: numpy array
         """
@@ -389,13 +394,13 @@ class CrossLayerScaling:
         return scaling_factor
 
     @staticmethod
-    def scale_cls_set_with_depthwise_layers(model: tf.Session, cls_set: Tuple[tf.Operation,
-                                                                              tf.Operation,
-                                                                              tf.Operation]) ->\
-            [np.ndarray, np.ndarray]:
+    def scale_cls_set_with_depthwise_layers(model: tf.compat.v1.Session,
+                                            cls_set: Tuple[tf.Operation,
+                                                           tf.Operation,
+                                                           tf.Operation]) -> [np.ndarray, np.ndarray]:
         """
         API to invoke equalize layer params for depth wise separable layers(update for weights and bias is in place)
-        :param model: active tf session
+        :param model: active tf.compat.v1.Session
         :param cls_set: Consecutive Conv layers whose weights and biases need to be equalized.
                         Second Conv layer is a depth-wise conv and third conv layer is point-wise conv
         :return: Scaling factors S_12 and S_23 : numpy arrays
@@ -512,8 +517,8 @@ class CrossLayerScaling:
         return cls_set_info_list
 
     @staticmethod
-    def scale_model(sess: tf.Session, input_op_names: Union[str, List[str]], output_op_names: Union[str, List[str]])\
-            -> (tf.Session, List[ClsSetInfo]):
+    def scale_model(sess: tf.compat.v1.Session, input_op_names: Union[str, List[str]], output_op_names: Union[str, List[str]])\
+            -> (tf.compat.v1.Session, List[ClsSetInfo]):
         """
         Uses cross-layer scaling to scale all applicable layers in the given model
 
@@ -533,7 +538,7 @@ class CrossLayerScaling:
 
         # Find layer groups
         graph_search = GraphSearchUtils(sess.graph, input_op_names, output_op_names)
-        layer_groups_as_tf_ops = graph_search.find_layer_groups_to_scale()
+        tf_op_to_conn_graph_op_map, layer_groups_as_tf_ops = graph_search.find_layer_groups_to_scale()
 
         # Find cls sets from the layer groups
         cls_sets = []
@@ -545,7 +550,8 @@ class CrossLayerScaling:
         scale_factors = CrossLayerScaling.scale_cls_sets(sess, cls_sets)
 
         # Find if there were relu activations between layers of each cls set
-        is_relu_activation_in_cls_sets = graph_search.is_relu_activation_present_in_cls_sets(cls_sets)
+        is_relu_activation_in_cls_sets = graph_search.is_relu_activation_present_in_cls_sets(cls_sets,
+                                                                                             tf_op_to_conn_graph_op_map)
 
         # Convert to a list of cls-set-info elements
         cls_set_info_list = CrossLayerScaling.create_cls_set_info_list(cls_sets, scale_factors,
@@ -566,10 +572,10 @@ class HighBiasFold:
     ScaleForFirstModule = np.ndarray
 
     @staticmethod
-    def get_bn_params_for_bias_fold(sess: tf.Session, bn_op: tf.Operation, scaling_parameter: np.ndarray):
+    def get_bn_params_for_bias_fold(sess: tf.compat.v1.Session, bn_op: tf.Operation, scaling_parameter: np.ndarray):
         """
 
-        :param sess: active TF session
+        :param sess: active tf.compat.v1.Session
         :param bn_op: tf Operation type fused batchnorm op.
         :param scaling_parameter: scaling param as np.ndarray
         :return: bn_params as BNParamsHighBiasFold type.
@@ -585,7 +591,7 @@ class HighBiasFold:
         return bn_params
 
     @staticmethod
-    def _refresh_layer_set_info_before_hbf(sess: tf.Session,
+    def _refresh_layer_set_info_before_hbf(sess: tf.compat.v1.Session,
                                            folded_pairs: List[Tuple[tf.Operation, tf.Operation]],
                                            cls_set_info_list: List[ClsSetInfo])\
             -> (List[ClsSetInfo], Dict[str, tf.Operation]):
@@ -593,7 +599,7 @@ class HighBiasFold:
         As the tensorflow session gets updated, info on op references need to be refreshed.
         :param folded_pairs: bn conv op pairs saved during batchnorm fold.
         :param cls_set_info_list: conv layer info saved during cross layer scaling
-        :return: refreshes both data sets to reflect references on new TF session.
+        :return: refreshes both data sets to reflect references on new tf.compat.v1.Session.
         """
 
         bn_dict = {}
@@ -610,8 +616,8 @@ class HighBiasFold:
         return cls_set_info_list, bn_dict
 
     @staticmethod
-    def bias_fold(sess: tf.Session, folded_pairs: List[Tuple[tf.Operation, tf.Operation]],
-                  cls_set_info_list: List[ClsSetInfo]) -> tf.Session:
+    def bias_fold(sess: tf.compat.v1.Session, folded_pairs: List[Tuple[tf.Operation, tf.Operation]],
+                  cls_set_info_list: List[ClsSetInfo]) -> tf.compat.v1.Session:
 
         """
         Folds bias values greater than 3 * sigma to next layer's bias
@@ -703,12 +709,12 @@ class HighBiasFold:
         return aftr_hbf_sess
 
 
-def equalize_model(sess: tf.Session, start_op_names: Union[str, List[str]],
-                   output_op_names: Union[str, List[str]]) -> tf.Session:
+def equalize_model(sess: tf.compat.v1.Session, start_op_names: Union[str, List[str]],
+                   output_op_names: Union[str, List[str]]) -> tf.compat.v1.Session:
     """
     High-level API to perform Cross-Layer Equalization (CLE) on the given model. The model is equalized in place.
 
-    :param sess: tf Session with model to equalize
+    :param sess: tf.compat.v1.Session with model to equalize
     :param start_op_names: Names of starting ops in the given model
     :param output_op_names: List of output op names of the model, used to help ConnectedGraph determine valid ops
            (to ignore training ops for example).

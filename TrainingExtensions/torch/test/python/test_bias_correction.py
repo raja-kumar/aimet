@@ -39,6 +39,7 @@
 import unittest.mock
 import copy
 import numpy as np
+import json
 
 import libpymo
 
@@ -75,7 +76,7 @@ class TestNet(nn.Module):
 
 class TestTrainingExtensionBnFold(unittest.TestCase):
     def test_get_output_of_layer(self):
-        model = TestNet().cuda()
+        model = TestNet()
         dataset_size = 2
         batch_size = 2
         data_loader = create_fake_data_loader(dataset_size=dataset_size, batch_size=batch_size)
@@ -89,7 +90,7 @@ class TestTrainingExtensionBnFold(unittest.TestCase):
         for batch in range(number_of_batches):
 
             images_in_one_batch, _ = iterator.__next__()
-            conv1_output = model.conv1(images_in_one_batch.cuda())
+            conv1_output = model.conv1(images_in_one_batch)
             conv2_input = conv1_output
             conv2_output = model.conv2(functional.relu(functional.max_pool2d(conv2_input, 2)))
             # compare the output from conv2 layer
@@ -99,7 +100,8 @@ class TestTrainingExtensionBnFold(unittest.TestCase):
 
     def test_get_ordering_of_nodes_in_model(self):
         model = mnist_model.ExtendedNet()
-        list_modules = get_ordered_list_of_conv_modules(model, input_shapes=(1, 1, 28, 28))
+        dummy_input = torch.randn(1, 1, 28, 28)
+        list_modules = get_ordered_list_of_conv_modules(model, dummy_input)
         self.assertEqual(list_modules[0][0], 'conv1')
         self.assertEqual(list_modules[1][0], 'conv2')
 
@@ -123,7 +125,7 @@ class TestTrainingExtensionBnFold(unittest.TestCase):
                                              default_output_bw=params.act_bw,
                                              default_param_bw=params.weight_bw,
                                              in_place=False,
-                                             input_shapes=(1, 1, 28, 28))
+                                             dummy_input=torch.rand(1, 1, 28, 28))
         quantsim.compute_encodings(pass_data_through_model, None)
         layer = quantsim.model.conv2
         quant_dequant_weights = bias_correction.get_quantized_dequantized_weight(layer, use_cuda)
@@ -150,7 +152,7 @@ class TestTrainingExtensionBnFold(unittest.TestCase):
         self.assertEqual(empirical_mock.call_count, 9)
         self.assertTrue(model.model[1][0].bias.detach().cpu().numpy() is not None)
 
-    def test_bias_correction_empirical(self):
+    def test_bias_correction_empirical_with_config_file(self):
         # Using a dummy extension of MNIST
         torch.manual_seed(10)
         model = mnist_model.Net()
@@ -163,8 +165,9 @@ class TestTrainingExtensionBnFold(unittest.TestCase):
 
         data_loader = create_fake_data_loader(dataset_size=dataset_size, batch_size=batch_size, image_size=(1, 28, 28))
 
+        # Takes default config file
         params = qsim.QuantParams(weight_bw=4, act_bw=4, round_mode="nearest",
-                                  quant_scheme=QuantScheme.post_training_tf
+                                  quant_scheme=QuantScheme.post_training_tf, config_file=None
                                   )
         with unittest.mock.patch('aimet_torch.bias_correction.call_empirical_mo_correct_bias') as empirical_mock:
             bias_correction.correct_bias(model, params, 2, data_loader, 2)
@@ -258,6 +261,35 @@ class TestTrainingExtensionBnFold(unittest.TestCase):
         self.assertEqual(analytical_mock.call_count, 2) # one layer ignored
         self.assertEqual(empirical_mock.call_count, 0)
 
+    def test_bias_correction_for_depthwise_transposed_conv2d(self):
+
+        torch.manual_seed(10)
+        model = torch.nn.Sequential(
+            torch.nn.ConvTranspose2d(10, 10, 3, groups=10),
+            torch.nn.BatchNorm2d(10),
+            torch.nn.ReLU(),
+            torch.nn.ConvTranspose2d(10, 10, 3),
+            torch.nn.BatchNorm2d(10),
+        )
+
+        model = model.eval()
+
+        # data_loader = create_fake_data_loader(dataset_size=dataset_size, batch_size=batch_size, image_size=(12, 4, 4),
+        #                                       )
+        data_loader = BatchIterator((1, 10, 4, 4))
+        params = qsim.QuantParams(weight_bw=8, act_bw=8, round_mode="nearest",
+                                  quant_scheme=QuantScheme.post_training_tf
+                                  )
+        conv_bn_dict = find_all_conv_bn_with_activation(model, input_shape=(1, 10, 4, 4))
+
+        with unittest.mock.patch('aimet_torch.bias_correction.call_analytical_mo_correct_bias') as analytical_mock:
+            with unittest.mock.patch('aimet_torch.bias_correction.call_empirical_mo_correct_bias') as empirical_mock:
+                bias_correction.correct_bias(model, params, 2, data_loader, 2, conv_bn_dict,
+                                             perform_only_empirical_bias_corr=False,
+                                             layers_to_ignore=[])
+
+        self.assertEqual(analytical_mock.call_count, 2) # one layer ignored
+        self.assertEqual(empirical_mock.call_count, 0)
 
 class BatchIterator:
     def __init__(self, img_size):

@@ -34,7 +34,7 @@
 #  @@-COPYRIGHT-END-@@
 # =============================================================================
 
-# Docker image file to build and test AIMET
+# Docker image file to build and test AIMET in a GPU environment
 
 FROM tensorflow/tensorflow:1.15.0-gpu-py3-jupyter
 
@@ -42,14 +42,14 @@ ENTRYPOINT ["/bin/bash"]
 
 RUN apt-get update > /dev/null && \
     apt-get install --no-install-recommends -y \
-
         # Bare minimum Packages
         ca-certificates \
         git \
         ssh \
         sudo \
         wget \
-        xterm > /dev/null && \
+        xterm \
+        xauth > /dev/null && \
         rm -rf /var/lib/apt/lists/*
 
 # Install certificates
@@ -83,14 +83,13 @@ RUN apt-get update > /dev/null && \
 # Python 2 pip installation
 RUN apt-get update && apt-get install -y python-pip && rm -rf /var/lib/apt/lists/* && \
     python2.7 -m pip --no-cache-dir install --upgrade \
-        pip==9.0.1 \
-        restkit==4.2.2 \
-        PyYAML
+        pip==20.3.4 \
+        restkit==4.2.2
 
 # Upgrade Python3 pip and install some more packages
 RUN pip3 --no-cache-dir install --upgrade \
         setuptools==41.0.1 \
-        pip==9.0.1 \
+        pip==20.2.4 \
         numpy==1.16.4 \
         wheel==0.33.4
 
@@ -111,7 +110,6 @@ RUN dpkg --add-architecture i386
 RUN apt-get update > /dev/null && \
     apt-get install --no-install-recommends -y \
         build-essential \
-        cmake \
         emacs \
         environment-modules \
         less \
@@ -150,25 +148,40 @@ RUN pip3 --no-cache-dir install \
         pillow==6.2.1 \
         pluggy==0.12.0 \
         protobuf==3.7.1 \
-        pybind11==2.2.3 \
+        psutil==5.8.0 \
+        ptflops==0.6.4 \
+        pybind11==2.6.1 \
+        pyDOE2==1.3.0 \
         pylint==2.3.1 \
+        pymoo==0.4.1 \
         pytest==4.6.5 \
         pytest-cov==2.6.1 \
         pytorch-ignite==0.1.0 \
         https://download.pytorch.org/whl/cu100/torchvision-0.5.0%2Bcu100-cp36-cp36m-linux_x86_64.whl \
         https://download.pytorch.org/whl/cu100/torch-1.4.0%2Bcu100-cp36-cp36m-linux_x86_64.whl \
         scikit-image==0.15.0 \
-        scikit-learn==0.19.1 \
-        scipy==1.1.0 \
+        scikit-learn==0.21.0 \
+        scipy==1.2.1 \
         sphinx==2.1.1 \
         sphinx-autodoc-typehints==1.6.0 \
-        tensorboard==1.14 \
+        tensorboard==1.15 \
         tensorboardX==1.7 \
         tensorlayer==2.1.0 \
+        timm==0.3.1 \
         torchtext==0.3.1 \
         tqdm==4.32.2 \
         wget==3.2 && \
     python3 -m ipykernel.kernelspec
+
+RUN cd /tmp && \
+    wget https://github.com/Kitware/CMake/releases/download/v3.19.3/cmake-3.19.3-Linux-x86_64.sh && \
+    mkdir /opt/cmake && \
+    sh cmake-3.19.3-Linux-x86_64.sh --prefix=/opt/cmake --skip-license
+
+RUN ln -s /opt/cmake/bin/cmake /usr/local/bin/cmake
+RUN ln -s /opt/cmake/bin/ctest /usr/local/bin/ctest
+RUN ln -s /opt/cmake/bin/cpack /usr/local/bin/cpack
+ENV PATH=/usr/local/bin:$PATH
 
 # Opencv
 # Ref: https://docs.opencv.org/3.1.0/d7/d9f/tutorial_linux_install.html
@@ -207,7 +220,7 @@ RUN sed 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so
 # Turn this into a development image
 RUN cd / && git clone https://github.com/tensorflow/tensorflow.git && cd tensorflow && git checkout v1.15.0
 
-RUN pip install git-pylint-commit-hook osqp onnx==1.6.0
+RUN pip install git-pylint-commit-hook osqp==0.6.1 onnx==1.7.0
 
 # bokeh requires Pillow while Pillow-SIMD is being used everywhere in Morpheus.
 # To install bokeh, we are installing all dependencies of bokeh other than Pillow.
@@ -216,18 +229,14 @@ RUN pip download bokeh==1.2.0 hvplot==0.4.0 -d /var/tmp/bokeh_hvplot_download | 
 RUN pip install --no-deps -r /var/tmp/bokeh_hvplot_requirements.txt
 # NOTE: We need to pin the holoviews version to this since the latest version has a circular dependency on bokeh 2.0.0 through the panel package
 RUN pip install holoviews==1.12.7 \
-                netron
+                netron==4.7.8
 
 RUN pip install --no-deps bokeh==1.2.0 hvplot==0.4.0
 RUN rm -rf /var/tmp/bokeh_hvplot_download /var/tmp/bokeh_hvplot_requirements.txt
 
-# Adding clang-format and clang-tidy
-RUN wget -O - http://llvm.org/apt/llvm-snapshot.gpg.key|sudo apt-key add - && echo "deb http://llvm.org/apt/xenial/ llvm-toolchain-xenial-3.8 main" >> /etc/apt/sources.list
-RUN apt-get update && apt-get install -y clang-3.8 clang-format clang-tidy-6.0 cuda-cublas-dev-10-0 cuda-curand-dev-10-0 && \
-    rm -rf /var/lib/apt/lists/*
+RUN wget -O - http://llvm.org/apt/llvm-snapshot.gpg.key|sudo apt-key add - && echo "deb http://apt.llvm.org/bionic/ llvm-toolchain-bionic-11 main" >> /etc/apt/sources.list
+RUN apt-get update && apt-get install -y clang-11 clang-format clang-tidy-11 cuda-cublas-dev-10-0 cuda-curand-dev-10-0 && \
+   rm -rf /var/lib/apt/lists/*
 
 # Create a version-less symbolic link for clang-tidy
-RUN ln -s /usr/bin/run-clang-tidy-6.0.py /usr/bin/run-clang-tidy.py
-
-RUN curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
-RUN sudo apt-get install git-lfs
+RUN ln -s /usr/bin/run-clang-tidy-11.py /usr/bin/run-clang-tidy.py

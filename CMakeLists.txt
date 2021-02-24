@@ -48,47 +48,139 @@ set(AIMET_PYTHONPATH
 set(AIMET_LD_LIBRARY_PATH
       "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/artifacts:$ENV{LD_LIBRARY_PATH}")
 
+# Set the software version from version.txt file (if not already set)
+if(NOT DEFINED SW_VERSION)
+  file(STRINGS "packaging/version.txt" SW_VERSION)
+  message(STATUS "Set SW_VERSION = ${SW_VERSION} from ${CMAKE_CURRENT_SOURCE_DIR}/packaging/version.txt")
+else()
+  message(STATUS "SW_VERSION already set to ${SW_VERSION}.")
+endif()
+
 find_package(Threads)
 # Disabling openMP since statically linked OpenMP in PyTorch (v1.5.0) seems to conflict with aimet usage
 #find_package(OpenMP REQUIRED)
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 
-enable_language(CUDA)
-set(CUDA_NVCC_FLAGS
-      -O3 -std=c++11 -I /usr/local -I /usr/local/cuda-10.0/include -x cu -Xcompiler -fPIC -D_GLIBCXX_USE_CXX11_ABI=0
+# -------------------------------
+# Conditional build for CUDA
+# -------------------------------
+if (NOT (DEFINED ENABLE_CUDA))
+  message("Compiling with CUDA not explicitly disabled. Enabling implicitly")
+  set(ENABLE_CUDA ON CACHE BOOL "")
 
-      -gencode arch=compute_35,code=sm_35
-      -gencode arch=compute_50,code=sm_50
-      -gencode arch=compute_52,code=sm_52
-      -gencode arch=compute_60,code=sm_60
-      -gencode arch=compute_61,code=sm_61
-      -gencode arch=compute_61,code=compute_61
-      -gencode arch=compute_70,code=compute_70
-   )
+endif(NOT (DEFINED ENABLE_CUDA))
+
+if (ENABLE_CUDA)
+  message("Compiling with CUDA enabled")
+
+  find_package(CUDAToolkit)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 52 60 61 70 72)
+  endif()
+
+  enable_language(CUDA)
+
+else(ENABLE_CUDA)
+  message("Compiling with CUDA disabled")
+
+endif(ENABLE_CUDA)
+
 set(LAPACKE_LIBRARY "/usr/lib/x86_64-linux-gnu/liblapacke.so.3.7.1")
 
 find_package(OpenCV REQUIRED)
 set(OPENCV_LIBRARY /usr/local/lib/libopencv_core.a)
 
+# ----------------------------------
+# Conditional build for PyTorch
+# ----------------------------------
+
+if (NOT (DEFINED ENABLE_TORCH))
+  message("AIMET Torch build not explicitly disabled. Enabling implicitly")
+  set(ENABLE_TORCH ON CACHE BOOL "")
+
+endif(NOT (DEFINED ENABLE_TORCH))
+
+if (ENABLE_TORCH)
+  # If we enable PyTorch builds then use the pybind11 headers that are part of the torch pip install
+  # So we don't have a version mismatch - between PyTorch custom C++ op code and PyMO
+  list(APPEND PYBIND11_INC_DIRS "/usr/local/lib/python3.6/dist-packages/torch/include")
+  list(APPEND PYBIND11_INC_DIRS "/usr/include/python3.6/")
+
+else (ENABLE_TORCH)
+  list(APPEND PYBIND11_INC_DIRS "/usr/local/lib/python3.6/dist-packages/pybind11/include/")
+  list(APPEND PYBIND11_INC_DIRS "/usr/include/python3.6/")
+
+  message("AIMET Torch build disabled")
+
+endif (ENABLE_TORCH)
+
+# ----------------------------------
+# PyBind11
+# ----------------------------------
+
 add_library(PYBIND11 SHARED IMPORTED)
 
-list(APPEND PYBIND11_INC_DIRS "/usr/local/lib/python3.6/dist-packages/torch/include")
-list(APPEND PYBIND11_INC_DIRS "/usr/include/python3.6/")
-
 set_target_properties(PYBIND11 PROPERTIES
-      IMPORTED_LOCATION "/usr/lib/x86_64-linux-gnu/libpython3.6m.so"
-      INTERFACE_INCLUDE_DIRECTORIES "${PYBIND11_INC_DIRS}"
-      )
+        IMPORTED_LOCATION "/usr/lib/x86_64-linux-gnu/libpython3.6m.so"
+        INTERFACE_INCLUDE_DIRECTORIES "${PYBIND11_INC_DIRS}"
+        )
 
-list(APPEND TENSORFLOW_INCLUDES "/usr/local/lib/python3.6/dist-packages/tensorflow_core/include")
-add_library(TensorFlow SHARED IMPORTED)
-set_target_properties(TensorFlow PROPERTIES
-      IMPORTED_LOCATION
-        "/usr/local/lib/python3.6/dist-packages/tensorflow_core/libtensorflow_framework.so.1"
-      INTERFACE_INCLUDE_DIRECTORIES
-        "${TENSORFLOW_INCLUDES}"
-      )
+# ----------------------------------
+# Conditional build for TensorFlow
+# ----------------------------------
 
+if (NOT (DEFINED ENABLE_TENSORFLOW))
+  message("AIMET TensorFlow build not explicitly disabled. Enabling implicitly")
+  set(ENABLE_TENSORFLOW ON CACHE BOOL "")
+
+endif(NOT (DEFINED ENABLE_TENSORFLOW))
+
+if (ENABLE_TENSORFLOW)
+  list(APPEND TENSORFLOW_INCLUDES "/usr/local/lib/python3.6/dist-packages/tensorflow_core/include")
+  add_library(TensorFlow SHARED IMPORTED)
+  set_target_properties(TensorFlow PROPERTIES
+        IMPORTED_LOCATION
+          "/usr/local/lib/python3.6/dist-packages/tensorflow_core/libtensorflow_framework.so.1"
+        INTERFACE_INCLUDE_DIRECTORIES
+          "${TENSORFLOW_INCLUDES}"
+        )
+
+else (ENABLE_TENSORFLOW)
+  message("AIMET TensorFlow build disabled")
+
+endif (ENABLE_TENSORFLOW)
+
+# -------------------------------
+# Generate pip packages
+# -------------------------------
+# Set the packaging path (if not already set)
+if(NOT DEFINED AIMET_PACKAGE_PATH)
+  set(AIMET_PACKAGE_PATH "\"${AIMET_INSTALL_DIR}\"")
+  message(STATUS "Set AIMET_PACKAGE_PATH = ${AIMET_PACKAGE_PATH}")
+endif(NOT DEFINED AIMET_PACKAGE_PATH)
+
+execute_process(COMMAND git config --get remote.origin.url WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} OUTPUT_VARIABLE remote_url)
+if(NOT remote_url STREQUAL "")
+  message(STATUS "Repo Remote URL = ${remote_url}")
+  string(REGEX REPLACE "\n$" "" remote_url "${remote_url}")
+  # Remove the ".git" suffix from the remote repo URL
+  string(REGEX REPLACE "\\.[^.]*$" "" remote_url ${remote_url})
+
+  set(remote_url_cfg "\"${remote_url}\"")
+  set(sw_version_cfg "\"${SW_VERSION}\"")
+
+  file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/packaging/setup_cfg.py" "version=${sw_version_cfg}\n")
+  file(APPEND "${CMAKE_CURRENT_SOURCE_DIR}/packaging/setup_cfg.py" "remote_url=${remote_url_cfg}")
+
+  add_custom_target(packageaimet
+    # Run the install target first
+    COMMAND "${CMAKE_COMMAND}" --build . --target install
+    # Now run the packaging target to generate wheel files
+    COMMAND ${CMAKE_COMMAND} -DAIMET_PACKAGE_PATH=${AIMET_PACKAGE_PATH} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR} -DENABLE_TENSORFLOW=${ENABLE_TENSORFLOW} -DENABLE_TORCH=${ENABLE_TORCH} -P ${CMAKE_CURRENT_SOURCE_DIR}/packaging/package_aimet.cmake
+  )
+else()
+  message(STATUS "Repo Remote URL is blank. Skipping packageaimet target")
+endif()
 
 enable_testing()
 
@@ -102,7 +194,7 @@ if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/Benchmarks")
 endif()
 
 # -------------------------------
-# Packaging
+# Packaging - deprecated
 # -------------------------------
 set(CPACK_PACKAGE_NAME "aimet")
 set(CPACK_PACKAGE_VERSION_MAJOR 0)

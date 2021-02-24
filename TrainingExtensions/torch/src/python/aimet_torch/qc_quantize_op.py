@@ -39,22 +39,22 @@
 
 import abc
 from enum import Enum
-from typing import Union
-
+from typing import Union, Dict
+import torch
 from torch import nn
-from aimet_common.utils import AimetLogger
-from aimet_common.defs import QuantScheme
-from aimet_torch.tensor_quantizer import PostTrainingTensorQuantizer
 
 import libpymo
-
+from aimet_common.utils import AimetLogger
+from aimet_common.defs import QuantScheme
+from aimet_torch import utils
+from aimet_torch.tensor_quantizer import PostTrainingTensorQuantizer
+import aimet_torch.quantsim_straight_through_grad as ste
 
 MAP_ROUND_MODE_TO_PYMO = {'nearest':     libpymo.RoundingMode.ROUND_NEAREST,
                           'stochastic':  libpymo.RoundingMode.ROUND_STOCHASTIC}
 
 MAP_QUANT_SCHEME_TO_PYMO = {QuantScheme.post_training_tf_enhanced: libpymo.QuantizationMode.QUANTIZATION_TF_ENHANCED,
                             QuantScheme.post_training_tf: libpymo.QuantizationMode.QUANTIZATION_TF}
-
 
 _logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
 
@@ -113,10 +113,14 @@ class QcQuantizeStandAloneBase(nn.Module):
         :param is_symmetric: Symmetric or asymmetric quantization
         """
         super(QcQuantizeStandAloneBase, self).__init__()
-        self.output_quantizer = tensor_quantizer_factory(activation_bw, round_mode,
-                                                         quant_scheme,
-                                                         is_symmetric,
-                                                         enabled_by_default=True)
+        self.output_quantizers = [tensor_quantizer_factory(activation_bw, round_mode,
+                                                           quant_scheme,
+                                                           is_symmetric,
+                                                           enabled_by_default=True)]
+        # Temporary to satisfy dependent code
+        # Todo: remove this once all dependent code has been cleaned up
+        self.output_quantizer = self.output_quantizers[0]
+
         self._mode = QcQuantizeOpMode.PASSTHROUGH
 
     @abc.abstractmethod
@@ -134,7 +138,7 @@ class QcQuantizeStandAloneBase(nn.Module):
         :param output_bw: Bitwidth from (4-32)
         :return: None
         """
-        self.output_quantizer.bitwidth = output_bw
+        self.output_quantizers[0].bitwidth = output_bw
 
     def set_mode(self, mode):
         """
@@ -168,7 +172,7 @@ class QcQuantizeStandAloneBase(nn.Module):
                     round_mode = tensor_quantizer.round_mode
                 else:
                     round_mode = libpymo.RoundingMode.ROUND_NEAREST
-                output = tensor_quantizer.quantize_dequantize(input_tensor, round_mode)
+                output = tensor_quantizer.quantize_dequantize(input_tensor, round_mode, self, 'output')
 
             else:
                 output = input_tensor
@@ -200,10 +204,15 @@ class QcQuantizeWrapper(nn.Module):
         :param is_symmetric: True if symmetric encoding is used.  False otherwise.
         """
         super(QcQuantizeWrapper, self).__init__()
-        self.output_quantizer = tensor_quantizer_factory(activation_bw, round_mode,
-                                                         quant_scheme,
-                                                         is_symmetric,
-                                                         enabled_by_default=is_output_quantized)
+        self.output_quantizers = [tensor_quantizer_factory(activation_bw, round_mode,
+                                                           quant_scheme,
+                                                           is_symmetric,
+                                                           enabled_by_default=is_output_quantized)]
+
+        # Temporary to satisfy dependent code
+        # Todo: remove this once all dependent code has been cleaned up
+        self.output_quantizer = self.output_quantizers[0]
+
         self._mode = QcQuantizeOpMode.PASSTHROUGH
         self._module_to_wrap = module_to_wrap
         # Using a _is_output_quantized variable instead of directly setting enabled_by_default for QcQuantizeBase since
@@ -240,7 +249,7 @@ class QcQuantizeWrapper(nn.Module):
         :param output_bw: Bitwidth from (4-32)
         :return: None
         """
-        self.output_quantizer.bitwidth = output_bw
+        self.output_quantizers[0].bitwidth = output_bw
 
     def set_mode(self, mode):
         """
@@ -248,6 +257,15 @@ class QcQuantizeWrapper(nn.Module):
         :param mode: Mode for the Quantization Ops. Can be PASSTHROUGH, ANALYSIS or ACTIVE
         """
         self._mode = mode
+
+    def reset_encodings(self):
+        """
+        Reset encoding stats and set encodings to None for all quantizers
+        """
+        self.input_quantizer.reset_encoding_stats()
+        self.output_quantizers[0].reset_encoding_stats()
+        for param_quantizer in self.param_quantizers.values():
+            param_quantizer.reset_encoding_stats()
 
 
 class QcPostTrainingWrapper(QcQuantizeWrapper):
@@ -282,24 +300,28 @@ class QcPostTrainingWrapper(QcQuantizeWrapper):
 
         # Quantize the inputs
         quantized_inputs = self._quantize_activation(self.input_quantizer, inputs)
-        if not isinstance(quantized_inputs, list):
+        if isinstance(quantized_inputs, torch.Tensor):
             quantized_inputs = [quantized_inputs]
 
         # Quantize the parameters
         shadow_params = self._quantize_dequantize_params()
 
+        # Save quantized parameters tensors for backward pass and perform custom bakward pass for gating parameters grad
+        # during backward pass
+        quantized_inputs = SteGatingFuncForParameters.apply(self, *quantized_inputs)
         # Call the forward of the wrapped module
         wrapped_output = self._module_to_wrap(*quantized_inputs)
 
         self._restore_shadow_params(shadow_params)
 
         # Quantize the outputs
-        if not self._is_output_quantized:
+
+        if not self.output_quantizers[0].enabled:
             output = wrapped_output
         else:
-            if not isinstance(wrapped_output, list):
+            if isinstance(wrapped_output, torch.Tensor):
                 wrapped_output = [wrapped_output]
-            output = self._quantize_activation(self.output_quantizer, wrapped_output)
+            output = self._quantize_activation(self.output_quantizers[0], wrapped_output)
 
         return output
 
@@ -324,21 +346,22 @@ class QcPostTrainingWrapper(QcQuantizeWrapper):
             shadow_params[name] = param.detach().clone()
 
             param_quantizer = self.param_quantizers[name]
+            if self._mode is not QcQuantizeOpMode.PASSTHROUGH and param_quantizer.enabled:
 
-            # If we are in training mode with quant-sim nodes, then we want to calculate encodings for the parameters
-            # in every pass
-            if self._module_to_wrap.training or param_quantizer.encoding is None:
-                param_quantizer.reset_encoding_stats()
-                param_quantizer.update_encoding_stats(param.data)
-                param_quantizer.compute_encoding()
+                # If we are in training mode with quant-sim nodes, then we want to calculate encodings for the
+                # parameters in every pass
+                if self._module_to_wrap.training or param_quantizer.encoding is None:
+                    param_quantizer.reset_encoding_stats()
+                    param_quantizer.update_encoding_stats(param.data)
+                    param_quantizer.compute_encoding()
 
-            # if we are not in training, then only nearest rounding should be used
-            # else we should use whatever the user desires (i.e.. stochastic rounding is a valid option)
-            if self.training:
-                round_mode = param_quantizer.round_mode
-            else:
-                round_mode = libpymo.RoundingMode.ROUND_NEAREST
-            param.data = param_quantizer.quantize_dequantize(param.data, round_mode)
+                # if we are not in training, then only nearest rounding should be used
+                # else we should use whatever the user desires (i.e.. stochastic rounding is a valid option)
+                if self.training:
+                    round_mode = param_quantizer.round_mode
+                else:
+                    round_mode = libpymo.RoundingMode.ROUND_NEAREST
+                param.data = param_quantizer.quantize_dequantize(param.data, round_mode)
 
         return shadow_params
 
@@ -356,10 +379,9 @@ class QcPostTrainingWrapper(QcQuantizeWrapper):
     def compute_encoding(self):
         """
         Compute the quantization encoding for this layer
-        :return: None
         """
         self.input_quantizer.compute_encoding()
-        self.output_quantizer.compute_encoding()
+        self.output_quantizers[0].compute_encoding()
 
     def _quantize_activation(self, tensor_quantizer, tensors_to_quantize):
         """
@@ -372,7 +394,13 @@ class QcPostTrainingWrapper(QcQuantizeWrapper):
 
         outputs = []
         for input_tensor in tensors_to_quantize:
-
+            if not isinstance(input_tensor, torch.Tensor):
+                _logger.error('Expecting quantize activation input of type torch.Tensor but got %s', type(input_tensor))
+                raise AssertionError
+            if input_tensor.dtype in utils.torch_integer_dtypes:
+                # Do not quantize integer tensors
+                outputs.append(input_tensor)
+                continue
             if self._mode is QcQuantizeOpMode.ANALYSIS:
 
                 tensor_quantizer.update_encoding_stats(input_tensor)
@@ -398,6 +426,22 @@ class QcPostTrainingWrapper(QcQuantizeWrapper):
 
         return outputs
 
+    def set_and_freeze_param_encoding(self, module_name: str, param_encodings: Dict):
+        """
+        Set and freeze encoding for parameter from encodings dictionary
+        :param module_name: name of module
+        :param param_encodings: parameter encodings dictionary
+        """
+        for orig_param_name, param_quantizer in self.param_quantizers.items():
+            param_name = module_name + '.' + orig_param_name
+            if param_name in param_encodings:
+                encoding_dict = param_encodings[param_name][0]
+                encoding, is_symmetric = utils.create_encoding_from_dict(encoding_dict)
+                param_quantizer.set_encoding(encoding)
+                param_quantizer.use_symmetric_encodings = is_symmetric
+                param_quantizer.freeze_encoding()
+                _logger.info("Setting and freezing quantization encodings for parameter: %s", param_name)
+
 
 class QcQuantizeStandalone(QcQuantizeStandAloneBase):
     """ A custom PyTorch module that derives from QcQuantizeStandAloneBase and quantizes inputs """
@@ -410,7 +454,7 @@ class QcQuantizeStandalone(QcQuantizeStandAloneBase):
         :return: Quantized output from the wrapped module
         """
 
-        output = self._quantize_activation(self.output_quantizer, list(inputs))
+        output = self._quantize_activation(self.output_quantizers[0], list(inputs))
 
         return output
 
@@ -419,4 +463,37 @@ class QcQuantizeStandalone(QcQuantizeStandAloneBase):
         Compute the quantization encoding for this op
         :return: None
         """
-        self.output_quantizer.compute_encoding()
+        self.output_quantizers[0].compute_encoding()
+
+
+class SteGatingFuncForParameters(torch.autograd.Function):
+    """
+    Custom gradient function for STE
+    """
+    # pylint:disable = arguments-differ
+    @staticmethod
+    def forward(ctx, quant_wrapper_ref, *quantized_input):
+        """
+        Quantize-dequantize the tensor, using the saved encoding for this tensor
+        :param tensor: Tensor to quantize-dequantize
+        :param tensor_quantizer: Reference to the tensor quantizer
+        :param round_mode: Rounding mode
+        :param wrapper_ref: Reference to quantization wrapper
+        :param tensor_name: Name of tensor to be quantized-dequantized
+        :return: Resulting tensor
+        """
+
+        ctx.quantization_wrapper_ref = quant_wrapper_ref
+        return quantized_input
+
+    @staticmethod
+    def backward(ctx, *output_grad):
+        quant_wrapper_ref = ctx.quantization_wrapper_ref
+
+        # pylint:disable = protected-access
+        for name, param in quant_wrapper_ref._module_to_wrap.named_parameters():
+            if quant_wrapper_ref.param_quantizers[name].enabled and param.grad is not None:
+                param_quantizer = quant_wrapper_ref.param_quantizers[name]
+                param.grad = ste.compute_dloss_by_dx(param, param.grad, param_quantizer.encoding.min,
+                                                     param_quantizer.encoding.max)
+        return (None, *output_grad)

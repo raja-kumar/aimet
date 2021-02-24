@@ -47,8 +47,8 @@
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 #
-# import os
-# import sys
+import os
+import sys
 # sys.path.insert(0, os.path.abspath('.'))
 
 
@@ -61,7 +61,16 @@ author = 'Qualcomm Innovation Center, Inc.'
 # The short X.Y version
 version = ''
 # The full version, including alpha/beta/rc tags
-release = '1.11.0'
+release = ''
+if "SW_VERSION" in os.environ:
+    release = os.environ['SW_VERSION']
+else:    
+    sys.exit("Unable to set version. SOFTWARE_VERSION is NOT defined.")
+
+included_features = 'tensorflow'
+
+def setup(app):
+    app.add_config_value('included_features', included_features, 'env')
 
 
 # -- General configuration ---------------------------------------------------
@@ -76,7 +85,8 @@ release = '1.11.0'
 extensions = [
     'sphinx.ext.autodoc',
     'sphinx_autodoc_typehints',
-    'sphinx.ext.autosectionlabel'
+    'sphinx.ext.autosectionlabel',
+    'sphinx.ext.ifconfig'
     # 'rinoh.frontend.sphinx'
 ]
 
@@ -116,7 +126,7 @@ autosectionlabel_prefix_document = True
 # a list of builtin themes.
 #
 html_theme = 'bizstyle'
-html_title = 'AI Model Efficiency Toolkit Documentation: ver 1.11.0'
+html_title = 'AI Model Efficiency Toolkit Documentation: ver ' + release
 html_logo = 'images/brain_logo.png'
 
 # Theme options are theme-specific and customize the look and feel of a theme

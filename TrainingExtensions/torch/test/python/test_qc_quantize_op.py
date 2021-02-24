@@ -1,4 +1,3 @@
-# /usr/bin/env python2.7
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -37,11 +36,12 @@
 # =============================================================================
 
 import unittest
-
+import unittest.mock
 import torch
 
 from aimet_common.defs import QuantScheme
 from aimet_torch.qc_quantize_op import QcPostTrainingWrapper, QcQuantizeOpMode
+import libpymo
 
 
 class TestQcQuantizeOp(unittest.TestCase):
@@ -60,7 +60,7 @@ class TestQcQuantizeOp(unittest.TestCase):
 
         output = quantize.forward(input_var)
         quantize.compute_encoding()
-        actual_encoding = quantize.output_quantizer.encoding
+        actual_encoding = quantize.output_quantizers[0].encoding
         print("Encoding returned: min={}, max={}, offset={}. delta={}, bw={}"
               .format(actual_encoding.min, actual_encoding.max,
                       actual_encoding.offset, actual_encoding.delta, actual_encoding.bw))
@@ -77,14 +77,89 @@ class TestQcQuantizeOp(unittest.TestCase):
         quantize.set_mode(QcQuantizeOpMode.ANALYSIS)
         output = quantize.forward(input_var)
         quantize.compute_encoding()
-        actual_encoding = quantize.output_quantizer.encoding
+        actual_encoding = quantize.output_quantizers[0].encoding
 
         print("Encoding returned: min={}, max={}, offset={}. delta={}, bw={}"
-              .format(quantize.output_quantizer.encoding.min,
-                      quantize.output_quantizer.encoding.max,
-                      quantize.output_quantizer.encoding.offset,
-                      quantize.output_quantizer.encoding.delta,
-                      quantize.output_quantizer.encoding.bw))
+              .format(quantize.output_quantizers[0].encoding.min,
+                      quantize.output_quantizers[0].encoding.max,
+                      quantize.output_quantizers[0].encoding.offset,
+                      quantize.output_quantizers[0].encoding.delta,
+                      quantize.output_quantizers[0].encoding.bw))
 
         quantize.set_mode(QcQuantizeOpMode.ACTIVE)
         output = quantize.forward(input_var)
+
+    def test_qc_post_training_wrapper(self):
+        torch.manual_seed(0)
+
+        encodings = libpymo.TfEncoding()
+        encodings.bw, encodings.max, encodings.min, encodings.delta, encodings.offset = 8, 0.5, -1, 1, 0.2
+
+        encodings_new = libpymo.TfEncoding()
+        encodings_new.bw, encodings_new.max, encodings_new.min, encodings_new.delta, encodings_new.offset = 8, 0.4, -0.98, 1, 0.2
+
+        output_grad = []
+        def hook_fn(m, _, i):
+
+            for grad in i:
+                try:
+                    output_grad.append(grad)
+                except AttributeError:
+                    print ("None found for Gradient")
+
+        conv1 = torch.nn.Conv2d(1, 2, 1)
+        quantize = QcPostTrainingWrapper(conv1, weight_bw=8, activation_bw=8, round_mode='nearest',
+                                         quant_scheme=QuantScheme.post_training_tf_enhanced)
+        quantize.train()
+        quantize._module_to_wrap.register_backward_hook(hook_fn)
+
+        quantize.input_quantizer.enabled = True
+        quantize.output_quantizers[0].enabled = True
+        quantize.input_quantizer.encoding = encodings
+        quantize.output_quantizers[0].encoding = encodings
+
+        new_input = torch.autograd.Variable(torch.tensor([[[[0.6469]]], [[[-0.9]]]]), requires_grad=True)
+        quantize.set_mode(QcQuantizeOpMode.ACTIVE)
+        out = quantize(new_input)
+
+        quantize.input_quantizer.encoding = encodings_new
+        quantize.output_quantizers[0].encoding = encodings_new
+        quantize.param_quantizers['weight'].encoding = encodings_new
+
+        loss = out.flatten().sum()
+        loss.backward()
+
+        # Check if input gradient got clipped
+        for i, val in enumerate(new_input):
+            if encodings_new.min > val or val > encodings_new.max:
+                self.assertTrue(new_input.grad[0][i] == 0.0)
+
+        # Check if output gradient got clipped
+        output_grad = output_grad[0].flatten()
+        self.assertTrue(output_grad[0] == 1.0)
+        self.assertTrue(output_grad[1] == 1.0)
+        self.assertTrue(output_grad[2] == 1.0)
+        self.assertTrue(output_grad[3] == 0.0)
+
+        # Check if weight gradient got clipped
+        weight_tensor = quantize._module_to_wrap.weight.flatten()
+        weight_tensor_grad = quantize._module_to_wrap.weight.grad.flatten()
+        for i, val in enumerate(weight_tensor):
+            if encodings_new.min > val or val > encodings_new.max:
+                self.assertTrue(weight_tensor_grad[i] == 0.0)
+
+    def test_quantize_maxpool_with_indices(self):
+        """ Test that maxpool2d returning int tensor can be quantized """
+        maxpool = torch.nn.MaxPool2d(2, return_indices=True)
+        quantize_op = QcPostTrainingWrapper(maxpool, weight_bw=8, activation_bw=8, round_mode='nearest',
+                                         quant_scheme=QuantScheme.post_training_tf_enhanced)
+        inp = torch.rand((1, 3, 8, 8))
+        quantize_op.set_mode(QcQuantizeOpMode.ANALYSIS)
+        quantize_op(inp)
+        quantize_op.compute_encoding()
+        quantize_op.set_mode(QcQuantizeOpMode.ACTIVE)
+        out, indices = quantize_op(inp)
+
+        # Check that one of the outputs of quantize_op is the indices with dtype int64
+        self.assertEqual(indices.dtype, torch.int64)
+        self.assertTrue(quantize_op.output_quantizers[0] is not None)

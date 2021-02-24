@@ -42,35 +42,15 @@ import torch
 from aimet_common.connected_graph.connectedgraph_utils import get_all_input_ops, get_all_output_ops
 from aimet_torch.examples.test_models import TinyModel, SingleResidual, MultiInput, ConcatModel, ModuleListModel,\
     ModelWithDropouts, SequentialModel, HierarchicalModel, PassThroughOpLastLayerModel, MultiOutputModel,\
-    TupleOutputModel, ConfigurableTupleOutputModel, BasicConv2d
+    TupleOutputModel, ConfigurableTupleOutputModel, BasicConv2d, DictInputModel, NestedSequentialModel
 
-from aimet_torch.meta.connectedgraph import _split_inputs, ConnectedGraph
+from aimet_torch.meta.connectedgraph import ConnectedGraph
 from aimet_torch.meta.connectedgraph_utils import get_module_act_func_pair
 from aimet_torch.utils import create_rand_tensors_given_shapes
 
 
 class TestConnectedGraph(unittest.TestCase):
     """ Unit tests for testing ConnectedGraph module"""
-
-    def test_split_inputs(self):
-        """ Test split_inputs() utility"""
-        named_groups = {}
-        inputs = 'input2, weight0, _3, [1, 1], False, [0,0], 1'
-        split = _split_inputs(inputs, named_groups)
-        self.assertEqual(9, len(split))
-
-        inputs = 'x1, [annotate(List[_3, _4], int), -1]'
-        split = _split_inputs(inputs, named_groups)
-        self.assertEqual('annotate(List[_3, _4], int)', split[1])
-        self.assertEqual(3, len(split))
-
-        with self.assertRaises(AssertionError):
-            inputs = 'input2, weight0, _3)'
-            _ = _split_inputs(inputs, named_groups)
-
-        with self.assertRaises(AssertionError):
-            inputs = 'input2, weight0, _3]'
-            _ = _split_inputs(inputs, named_groups)
 
     def test_single_residual(self):
         """ Test building ConnectedGraph on single residual model """
@@ -102,7 +82,7 @@ class TestConnectedGraph(unittest.TestCase):
         inp_tensor_list = create_rand_tensors_given_shapes([inp_shape_1, inp_shape_2])
         conn_graph = ConnectedGraph(model, inp_tensor_list)
         self.assertEqual(11, len(conn_graph.ordered_ops))
-        # Split count of 2 due to residual as well as reshape having a split
+        # Split count of 1 due to reshape having a split
         self.assertEqual(1, conn_graph._split_count)
         conv1 = conn_graph.get_op_from_module_name('MultiInput.conv1')
         self.assertEqual(model.conv1, conv1.get_module())
@@ -275,12 +255,12 @@ class TestConnectedGraph(unittest.TestCase):
 
         expected_products = [
             # layer #1 to conv1,conv2
-            'convolution_0_to_convolution_6',
-            'convolution_2_to_convolution_7',
+            'convolution_0_to_convolution_3',
+            'convolution_2_to_convolution_4',
 
             # conv1,conv2 to cat
-            'convolution_6_to_cat_8',
-            'convolution_7_to_cat_8']
+            'convolution_3_to_cat_5',
+            'convolution_4_to_cat_5']
 
         products = conn_graph.get_all_products()
         for product_name in product_names:
@@ -321,19 +301,19 @@ class TestConnectedGraph(unittest.TestCase):
 
         expected_products = [
             # layer #1 to layer #2
-            'convolution_0_to_convolution_7',
-            'convolution_1_to_convolution_8',
-            'convolution_2_to_convolution_9',
+            'convolution_0_to_convolution_3',
+            'convolution_1_to_convolution_4',
+            'convolution_2_to_convolution_5',
 
             # layer #2 to layer #3
-            'convolution_7_to_convolution_14',
-            'convolution_8_to_convolution_15',
-            'convolution_9_to_convolution_16',
+            'convolution_3_to_convolution_6',
+            'convolution_4_to_convolution_7',
+            'convolution_5_to_convolution_8',
 
             # layer #3 to cat
-            'convolution_14_to_cat_21',
-            'convolution_15_to_cat_21',
-            'convolution_16_to_cat_21']
+            'convolution_6_to_cat_9',
+            'convolution_7_to_cat_9',
+            'convolution_8_to_cat_9']
 
         products = conn_graph.get_all_products()
         for product_name in product_names:
@@ -377,18 +357,18 @@ class TestConnectedGraph(unittest.TestCase):
 
             # layer #1 to layer #2
             'convolution_0__to__Split_0',
-            'convolution_1_to_convolution_7',
-            'convolution_2_to_convolution_8',
+            'convolution_1_to_convolution_3',
+            'convolution_2_to_convolution_4',
 
             # layer #2 to layer #3
-            'convolution_7_to_convolution_16',
-            'convolution_8_to_convolution_14',
-            'convolution_9_to_convolution_15',
+            'convolution_3_to_convolution_8',
+            'convolution_4_to_convolution_6',
+            'convolution_5_to_convolution_7',
 
             # layer #3, layer#1.conv1 to cat
-            'convolution_14_to_cat_21',
-            'convolution_15_to_cat_21',
-            'convolution_16_to_cat_21']
+            'convolution_6_to_cat_9',
+            'convolution_7_to_cat_9',
+            'convolution_8_to_cat_9']
 
         products = conn_graph.get_all_products()
         for product_name in product_names:
@@ -397,9 +377,9 @@ class TestConnectedGraph(unittest.TestCase):
                 self.assertEqual(product.shape, product.producer.output_shape)
                 expected_products.remove(product_name)
         self.assertEqual(0, len(expected_products))
-        Split_product = conn_graph.get_all_products()['Split_0__to__multiple_ops']
-        self.assertTrue(conn_graph.get_all_ops()['convolution_9'] in Split_product.consumers)
-        self.assertTrue(conn_graph.get_all_ops()['cat_21'] in Split_product.consumers)
+        split_product = conn_graph.get_all_products()['Split_0__to__multiple_ops']
+        self.assertTrue(conn_graph.get_all_ops()['convolution_5'] in split_product.consumers)
+        self.assertTrue(conn_graph.get_all_ops()['cat_9'] in split_product.consumers)
 
     def test_submodules_with_sequence_and_module_list(self):
         """ Test building ConnectedGraph on a model with sequence and module list """
@@ -491,3 +471,47 @@ class TestConnectedGraph(unittest.TestCase):
         self.assertEqual(2, len([op for name, op in conn_graph.get_all_ops().items()
                                  if 'relu' in name and
                                  op.get_module() == layer_model.layer.relu]))
+
+    def test_dict_input(self):
+        """ Test building ConnectedGraph on a model with multiple inputs """
+        # pylint: disable=protected-access
+        model = DictInputModel()
+        model.eval()
+        inp_shape_1 = (1, 3, 32, 32)
+        inp_shape_2 = (1, 3, 20, 20)
+        inp_tensor_list = create_rand_tensors_given_shapes([inp_shape_1, inp_shape_2])
+        dict_input = {'inp_1': inp_tensor_list[0], 'inp_2': inp_tensor_list[1]}
+        conn_graph = ConnectedGraph(model, dict_input)
+        self.assertEqual(11, len(conn_graph.ordered_ops))
+
+        # Split count of 1 due to reshape having a split
+        self.assertEqual(1, conn_graph._split_count)
+        conv1 = conn_graph.get_op_from_module_name('DictInputModel.conv1')
+        self.assertEqual(model.conv1, conv1.get_module())
+        self.assertEqual(2, len(conv1.inputs))
+        conv2 = conn_graph.get_op_from_module_name('DictInputModel.conv2')
+        self.assertEqual(model.conv2, conv2.get_module())
+        self.assertEqual(3, len(conv2.inputs))
+        conv3 = conn_graph.get_op_from_module_name('DictInputModel.conv3')
+        self.assertEqual(model.conv3, conv3.get_module())
+        self.assertEqual(3, len(conv3.inputs))
+
+        input_ops = get_all_input_ops(conn_graph)
+        input_modules = [op.get_module() for op in input_ops]
+        self.assertEqual(2, len(input_ops))
+        self.assertTrue(model.conv1 in input_modules)
+        self.assertTrue(model.conv3 in input_modules)
+        output_ops = get_all_output_ops(conn_graph)
+        self.assertEqual(1, len(output_ops))
+        self.assertEqual(model.fc, output_ops[0].get_module())
+
+    def test_nested_sequential(self):
+        # pylint: disable=protected-access
+        """ Test building ConnectedGraph on a model constructed with nested nn.Sequential Module """
+        model = NestedSequentialModel()
+        model.eval()
+        inp_data_1 = torch.rand(1, 3, 8, 8)
+        conn_graph = ConnectedGraph(model, (inp_data_1,))
+        self.assertEqual(10, len(conn_graph.ordered_ops))
+        # Expect 1 split for the reshape operation
+        self.assertEqual(1, conn_graph._split_count)

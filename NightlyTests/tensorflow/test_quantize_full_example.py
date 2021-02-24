@@ -37,8 +37,8 @@
 # =============================================================================
 
 import json
+import pytest
 import unittest
-import shutil
 import os
 import numpy as np
 import tensorflow as tf
@@ -58,11 +58,12 @@ import libpymo as pymo
 
 class Quantization(unittest.TestCase):
 
+    @pytest.mark.cuda
     def test_gpu_quantize_mnist(self):
         """
         Running Quantize Test with GPU ops
         """
-        tf.reset_default_graph()
+        tf.compat.v1.reset_default_graph()
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
         # Allocate the generator you wish to use to provide the network with data
@@ -99,7 +100,7 @@ class Quantization(unittest.TestCase):
             print('Quantized performance: ' + str(perf * 100))
 
             ce = g.get_tensor_by_name("xent:0")
-            ts = tf.train.AdamOptimizer(1e-3, name="TempAdam").minimize(ce)
+            ts = tf.compat.v1.train.AdamOptimizer(1e-3, name="TempAdam").minimize(ce)
             graph_eval.initialize_uninitialized_vars(sess)
 
             mnist = input_data.read_data_sets('./data', one_hot=True)
@@ -118,19 +119,20 @@ class Quantization(unittest.TestCase):
         # close session
         sess.close()
 
+    @pytest.mark.cuda
     def test_gpu_quantize_resnet50(self):
 
         print('Running Quantize Test with GPU ops')
 
-        tf.reset_default_graph()
+        tf.compat.v1.reset_default_graph()
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
         graph = tf.Graph()
-        sess = tf.Session(graph=graph)
+        sess = tf.compat.v1.Session(graph=graph)
         with sess.as_default():
             with sess.graph.as_default():
                 model = tf.keras.applications.resnet50.ResNet50(weights=None)
-                init = tf.global_variables_initializer()
+                init = tf.compat.v1.global_variables_initializer()
                 sess.run(init)
 
         quantsim_config = {
@@ -201,7 +203,7 @@ class Quantization(unittest.TestCase):
                 self.assertEqual(sim.session.run(op_mode_tensor),
                                  int(pymo.TensorQuantizerOpMode.oneShotQuantizeDequantize))
 
-        def dummy_forward_pass(session: tf.Session, args):
+        def dummy_forward_pass(session: tf.compat.v1.Session, args):
             out_tensor = session.graph.get_tensor_by_name(model.outputs[0].name)
             in_tensor = session.graph.get_tensor_by_name(model.inputs[0].name)
             dummy_input = np.random.rand(1, 224, 224, 3)
@@ -223,7 +225,7 @@ class Quantization(unittest.TestCase):
 
         print('Running Quantize Test with CPU ops')
 
-        tf.reset_default_graph()
+        tf.compat.v1.reset_default_graph()
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
         # Allocate the generator you wish to use to provide the network with data
@@ -234,7 +236,8 @@ class Quantization(unittest.TestCase):
         sess = graph_saver.load_model_from_meta('models/mnist_save.meta', 'models/mnist_save')
 
         # Allocate the quantizer and quantize the network using the default 8 bit params/activations
-        sim = quantsim.QuantizationSimModel(sess, ['reshape_input'], ['dense_1/BiasAdd'], quant_scheme='tf')
+        sim = quantsim.QuantizationSimModel(sess, ['reshape_input'], ['dense_1/BiasAdd'], quant_scheme='tf',
+                                            use_cuda=False)
 
         def forward_callback(session, iterations):
             graph_eval.evaluate_graph(session, generator, ['accuracy'], graph_eval.default_eval_func, iterations)
@@ -271,7 +274,7 @@ class Quantization(unittest.TestCase):
 
     def test_skip_bias_quantization(self):
 
-        tf.reset_default_graph()
+        tf.compat.v1.reset_default_graph()
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
         # Allocate the generator you wish to use to provide the network with data
@@ -282,7 +285,8 @@ class Quantization(unittest.TestCase):
         sess = graph_saver.load_model_from_meta('models/mnist_save.meta', 'models/mnist_save')
 
         # Allocate the quantizer and quantize the network using the default 8 bit params/activations
-        sim = quantsim.QuantizationSimModel(sess, ['reshape_input'], ['dense_1/BiasAdd'], quant_scheme='tf')
+        sim = quantsim.QuantizationSimModel(sess, ['reshape_input'], ['dense_1/BiasAdd'], quant_scheme='tf',
+                                            use_cuda=False)
 
         def forward_callback(session, iterations):
             graph_eval.evaluate_graph(session, generator, ['accuracy'], graph_eval.default_eval_func, iterations)
@@ -305,15 +309,16 @@ class Quantization(unittest.TestCase):
     def test_quantize_multi_input_mode(self):
         """ Test fill_op_product_graph() on a multiple input graph """
 
-        tf.reset_default_graph()
+        tf.compat.v1.reset_default_graph()
         model_output = multiple_input_model()
-        sess = tf.Session(graph=tf.get_default_graph())
+        sess = tf.compat.v1.Session(graph=tf.compat.v1.get_default_graph())
         graph_eval.initialize_uninitialized_vars(sess)
 
         sim = quantsim.QuantizationSimModel(sess, starting_op_names=['input1', 'input2'],
-                                            output_op_names=['multiple_input_model/Softmax'])
+                                            output_op_names=['multiple_input_model/Softmax'],
+                                            use_cuda=False)
 
-        def forward_callback(session: tf.Session, iterations):
+        def forward_callback(session: tf.compat.v1.Session, iterations):
             input_tensor1 = np.random.rand(32, 10, 10, 3)
             input_tensor2 = np.random.rand(32, 12, 12, 3)
 

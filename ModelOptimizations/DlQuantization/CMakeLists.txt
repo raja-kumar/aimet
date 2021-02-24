@@ -69,10 +69,12 @@ add_library(MoDlQuantization STATIC
       include/DlQuantization/TensorQuantizationSimForPython.h
       include/DlQuantization/TensorQuantizer.h)
 
+if (ENABLE_CUDA)
 target_compile_options(MoDlQuantization
       PRIVATE
          -DGPU_QUANTIZATION_ENABLED=1
       )
+endif (ENABLE_CUDA)
 
 target_include_directories(MoDlQuantization
       PUBLIC
@@ -82,8 +84,9 @@ target_include_directories(MoDlQuantization
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-add_library(MoDlQuantizationCuda
+if (ENABLE_CUDA)
 
+    add_library(MoDlQuantizationCuda
       src/math_functions.cu
       src/cuda_util.cu
       src/trim_functions.cu
@@ -91,9 +94,13 @@ add_library(MoDlQuantizationCuda
       src/trim_functions.cuh
       )
 
-target_compile_options(MoDlQuantizationCuda
-      PRIVATE
-         -Xcompiler -fPIC)
+    target_compile_options(MoDlQuantizationCuda
+            PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+            --generate-line-info
+            --use_fast_math>
+            -Xcompiler -fPIC
+            )
 
+endif (ENABLE_CUDA)
 
 add_subdirectory(test)

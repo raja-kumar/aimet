@@ -47,23 +47,36 @@ import json
 import tensorflow as tf
 from tensorflow.python.framework import ops as tf_ops
 from tensorflow.contrib import graph_editor
-
 from aimet_common.defs import QuantScheme
 from aimet_common.quantsim import gate_min_max, calculate_delta_offset
 from aimet_common.utils import AimetLogger
-from aimet_tensorflow.utils.common import update_variables_with_values, \
-    save_data_to_pickle_file, load_data_from_pickle_file
+from aimet_tensorflow.common import core
+from aimet_tensorflow.utils.common import update_variables_with_values, save_data_to_pickle_file, \
+    load_data_from_pickle_file, get_valid_ops
 from aimet_tensorflow.utils import graph_saver
 from aimet_tensorflow.utils.constants import QuantizeOpIndices
-from aimet_tensorflow.utils.quantsim import create_op_to_quant_ops_dict
-from aimet_tensorflow.common import core
+from aimet_tensorflow.utils.quantsim import create_op_to_quant_ops_dict, is_op_quantizable, \
+    get_time_steps_tensor_from_rnn_inner_ops
+from aimet_tensorflow.utils.graph import updated_graph_flow_context_to_loop_context, set_graph_flow_context, \
+    op_not_in_loop_control_flow_context
 from aimet_tensorflow.common.connectedgraph import ConnectedGraph
 from aimet_tensorflow.quantsim_config.quantsim_config import QuantSimConfigurator
+from aimet_tensorflow.quantsim_recurrent import _select_simple_rnn_internal_ops_to_quantize, \
+    _select_lstm_internal_ops_to_quantize, SUPPORTED_RECURRENT_TYPES
 
+# this is required to associate gradient with QcQuantize op
+from aimet_tensorflow import quantsim_straight_through_grad      # pylint: disable=unused-import
 import libpymo
+
+
+# pylint: disable=too-many-lines
 
 _logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
 WORKING_DIR = '/tmp/quantsim/'
+
+
+# Op types which we will not place quantize ops after
+op_types_to_ignore = {'branch', 'Flatten', 'Shape'}
 
 DTYPES_QUANTIZE_NOT_REQUIRED = [tf.dtypes.int8, tf.dtypes.uint8, tf.dtypes.int16, tf.dtypes.uint16,
                                 tf.dtypes.int32, tf.dtypes.uint32, tf.dtypes.int64, tf.dtypes.uint64,
@@ -82,21 +95,6 @@ class QuantizerType(Enum):
     """ Enum for quantize op types """
     param = 0
     activation = 1
-
-# Op types which we will not place quantize ops after
-op_types_to_ignore = {'branch', 'Flatten', 'Shape'}
-
-# by default we will have this registered for Qc Quantize op.
-@tf_ops.RegisterGradient("QcQuantize")
-def _qc_dummy_quantized_grad(op, grad):
-    # pylint: disable=unused-argument
-    """
-    Dummy function to allow QcQuantize op to not do any gradient calculations
-    :param op: quantize op
-    :param grad: gradient
-    :return: gradients computed per input
-    """
-    return grad, None, None, None, None, None, None
 
 
 class PickleableTensorQuantizerState:
@@ -125,7 +123,7 @@ class QuantizerInfo:
 
     __slots__ = ['session', 'tensor_quantizer', 'quant_op_name', 'quantizer_type']
 
-    def __init__(self, session: tf.Session, tensor_quantizer: libpymo.TensorQuantizer,
+    def __init__(self, session: tf.compat.v1.Session, tensor_quantizer: libpymo.TensorQuantizer,
                  quant_op_name: str, quantizer_type: QuantizerType):
         self.session = session
         self.tensor_quantizer = tensor_quantizer
@@ -141,7 +139,7 @@ class QuantizerInfo:
         """
 
         with self.session.graph.as_default():
-            vars_with_given_name = [var for var in tf.global_variables()
+            vars_with_given_name = [var for var in tf.compat.v1.global_variables()
                                     if var.op.name == var_name]
         var_to_be_updated = vars_with_given_name[0]
         var_to_be_updated.load(value, self.session)
@@ -363,9 +361,10 @@ class QuantizationSimModel:
 
     """
     # pylint: disable=too-many-arguments
-    def __init__(self, session: tf.Session, starting_op_names: List[str], output_op_names: List[str],
+    def __init__(self, session: tf.compat.v1.Session, starting_op_names: List[str], output_op_names: List[str],
                  quant_scheme: Union[str, QuantScheme] = 'tf_enhanced', rounding_mode: str = 'nearest',
-                 default_output_bw: int = 8, default_param_bw: int = 8, use_cuda: bool = True, config_file: str = None):
+                 default_output_bw: int = 8, default_param_bw: int = 8, use_cuda: bool = True, config_file: str = None
+                 ):
         """
         :param session: The input model as session to add quantize ops to
         :param starting_op_names: List of starting op names of the model
@@ -410,7 +409,7 @@ class QuantizationSimModel:
 
         # We save a copy of the original model (to be used during export later)
         with self.session.graph.as_default():
-            saver = tf.train.Saver()
+            saver = tf.compat.v1.train.Saver()
         saver.save(self.session, save_path=WORKING_DIR+'orig_model_before_quantsim')
 
         self._add_and_configure_quant_nodes(starting_op_names, output_op_names, default_param_bw, default_output_bw,
@@ -463,19 +462,19 @@ class QuantizationSimModel:
             quant_op = self.session.graph.get_operation_by_name(op_name)
             vars_with_value[quant_op.name + '_encoding_min'] = encoding.min
             vars_with_value[quant_op.name + '_encoding_max'] = encoding.max
+
             vars_with_value[quant_op.name + '_op_mode'] = int(op_mode)
             update_variables_with_values(self.session, vars_with_value)
 
-    def _get_op_variable_value(self, quant_op_name: str, var_index: int):
+    def _get_op_variable_value(self, quant_op: tf.Operation, var_index: int):
         """
         Utility to load variable values from quant op
-        :param quant_op_name: quantize op name
+        :param quant_op: quantize op
         :param var_index: variable index to be read
         :return: variable value
         """
 
-        op = self.session.graph.get_operation_by_name(quant_op_name)
-        op_var_tensor = op.inputs[var_index]
+        op_var_tensor = quant_op.inputs[var_index]
         return self.session.run(op_var_tensor)
 
     def _get_bitwidth_and_symmetric_flag(self, quant_op_name: str) -> (int, bool):
@@ -485,10 +484,11 @@ class QuantizationSimModel:
         :return: bitwidth and symmetric encoding flag
         """
 
-        op_bitwidth = self._get_op_variable_value(quant_op_name,
-                                                  int(QuantizeOpIndices.bit_width))
-        op_use_symmetric_encodings = self._get_op_variable_value(quant_op_name,
-                                                                 int(QuantizeOpIndices.use_symmetric_encoding))
+        op = self.session.graph.get_operation_by_name(quant_op_name)
+        op_bitwidth = self._get_op_variable_value(op,
+                                                  QuantizeOpIndices.bit_width)
+        op_use_symmetric_encodings = self._get_op_variable_value(op,
+                                                                 QuantizeOpIndices.use_symmetric_encoding)
 
         return op_bitwidth, op_use_symmetric_encodings
 
@@ -507,11 +507,12 @@ class QuantizationSimModel:
                           'quantization ops is being done, and get_ops_to_quantize_activations_for() has been '
                           'overriden, please override configure_quantization_ops() as well.')
             raise AssertionError
-        op_to_quant_ops_dict = create_op_to_quant_ops_dict(self.session.graph, conn_graph, ops_with_param_names,
-                                                           indices, activation_op_names)
+        op_to_quant_ops_dict = create_op_to_quant_ops_dict(self.session.graph, conn_graph,
+                                                           ops_with_param_names, indices,
+                                                           activation_op_names)
         QuantSimConfigurator(self.session, conn_graph, op_to_quant_ops_dict, config_file)
 
-    def compute_encodings(self, forward_pass_callback: Callable[[tf.Session, Any], None],
+    def compute_encodings(self, forward_pass_callback: Callable[[tf.compat.v1.Session, Any], None],
                           forward_pass_callback_args):
         """
         Computes encodings for all quantization sim nodes in the model.
@@ -534,28 +535,47 @@ class QuantizationSimModel:
         # Run data through the quantsim so we can compute activation encodings
         forward_pass_callback(self.session, forward_pass_callback_args)
 
+        ops_with_invalid_encodings = []
+
         # For activations, calculate encodings and update min-max parameters
         for op_name, quantizer_info in self._activation_quantizers.items():
-
             # Calculate encodings
             if quantizer_info.get_op_mode() != int(libpymo.TensorQuantizerOpMode.passThrough):
                 op_bitwidth, op_use_symmetric_encodings = self._get_bitwidth_and_symmetric_flag(
                     quantizer_info.quant_op_name)
                 encoding = quantizer_info.tensor_quantizer.computeEncoding(op_bitwidth, op_use_symmetric_encodings)
-                self._set_op_input_variables(op_name, encoding, libpymo.TensorQuantizerOpMode.quantizeDequantize)
+                if quantizer_info.tensor_quantizer.isEncodingValid:
+                    self._set_op_input_variables(op_name, encoding, libpymo.TensorQuantizerOpMode.quantizeDequantize)
+                else:
+                    self._set_op_input_variables(op_name, encoding, libpymo.TensorQuantizerOpMode.passThrough)
+                    ops_with_invalid_encodings.append(op_name)
 
         # For post-training mode, params will always be in one-shot mode
         op_mode = QuantizationSimModel._param_op_mode_after_analysis(self._quant_scheme)
 
         for op_name, quantizer_info in self._param_quantizers.items():
-
             if quantizer_info.get_op_mode() != int(libpymo.TensorQuantizerOpMode.passThrough):
                 op_bitwidth, op_use_symmetric_encodings = self._get_bitwidth_and_symmetric_flag(
                     quantizer_info.quant_op_name)
                 encoding = quantizer_info.tensor_quantizer.computeEncoding(op_bitwidth, op_use_symmetric_encodings)
-                self._set_op_input_variables(op_name, encoding, op_mode)
+                if quantizer_info.tensor_quantizer.isEncodingValid:
+                    self._set_op_input_variables(op_name, encoding, op_mode)
+                else:
+                    self._set_op_input_variables(op_name, encoding, libpymo.TensorQuantizerOpMode.passThrough)
+                    ops_with_invalid_encodings.append(op_name)
 
-    def export(self, path: str, filename_prefix: str, orig_sess: tf.Session = None):
+        if ops_with_invalid_encodings:
+            _logger.info('The following quantizers did not have valid encodings and have been set to passThrough mode: '
+                         '%s', ops_with_invalid_encodings)
+            _logger.info('This can be due to the quantizers not having been evaluated during the forward pass in '
+                         'compute encodings. Evaluation is required to collect statistics needed to compute valid '
+                         'encodings.\n'
+                         'As a result, the quantizers have been set to passThrough mode, meaning no quantization noise '
+                         'will be simulated for these ops if they are evaluated in the future.\n'
+                         'If this is not desired, amend the forward pass to evaluate tensors which require these ops '
+                         'to be evaluated, and recompute encodings.')
+
+    def export(self, path: str, filename_prefix: str, orig_sess: tf.compat.v1.Session = None):
         """
         This method exports out the quant-sim model so it is ready to be run on-target.
 
@@ -576,25 +596,72 @@ class QuantizationSimModel:
         # save session without quant nodes
         if orig_sess is not None:
             with orig_sess.graph.as_default():
-                saver = tf.train.Saver()
+                saver = tf.compat.v1.train.Saver()
             saver.save(orig_sess, save_path=WORKING_DIR+'orig_model_before_quantsim')
         else:
             _logger.info('Original session is not provided, use orig_model_before_quantsim.meta to export')
 
         vars_to_save = []
         with self.session.graph.as_default():
-            for var in tf.global_variables():
+            for var in tf.compat.v1.global_variables():
                 if not var.name[:-2].endswith(('_quantized', '_quantized_op_mode', '_quantized_quant_ref',
                                                '_quantized_encoding_min', '_quantized_encoding_max',
                                                '_quantized_bit_width', '_quantized_use_symmetric_encoding')):
                     vars_to_save.append(var)
 
-            saver = tf.train.Saver(vars_to_save)
+            saver = tf.compat.v1.train.Saver(vars_to_save)
             saver.save(self.session, save_path=os.path.join(path, filename_prefix))
             shutil.copyfile(WORKING_DIR+'orig_model_before_quantsim.meta',
                             os.path.join(path, filename_prefix) + '.meta')
 
         self._export_encodings(os.path.join(path, filename_prefix) + '.encodings')
+
+    def save_to_keras(self, temp_dir_path: str = "/tmp/") -> tf.compat.v1.Session:
+        """
+        This method exports out the quant-sim model so it is ready to be eval/trained using a Keras pipeline
+
+        :param temp_dir_path: temporary directory to store intermediate files
+        :return: Session to import into a Keras model
+
+        """
+        current_graph = self.session.graph
+        with current_graph.as_default():
+            ops = current_graph.get_operations()
+            for op in ops:
+                if op.type in ['QcQuantize', 'QcQuantizeRecurrentParam']:
+
+                    # Read the config
+                    # -----------------
+                    quant_config = self.quantizer_config(op.name)
+                    config_tuple = self.session.run([op.inputs[QuantizeOpIndices.op_mode],
+                                                     op.inputs[QuantizeOpIndices.encoding_min],
+                                                     op.inputs[QuantizeOpIndices.encoding_max],
+                                                     op.inputs[QuantizeOpIndices.bit_width],
+                                                     op.inputs[QuantizeOpIndices.use_symmetric_encoding]])
+                    op_mode, encoding_min, encoding_max, bitwidth, is_symmetric = config_tuple
+
+                    # Create the static op
+                    # --------------------
+                    if not self._use_cuda:
+                        with tf.device('/cpu:0'):
+                            static_op = qcops.qc_quantize_static(name=op.name+"_static", in_tensor=op.inputs[0],
+                                                                 encoding_min=encoding_min, encoding_max=encoding_max,
+                                                                 bitwidth=bitwidth, quant_scheme=quant_config.quant_scheme,
+                                                                 op_mode=op_mode, is_symmetric=bool(is_symmetric))
+                    else:
+                        static_op = qcops.qc_quantize_static(name=op.name + "_static", in_tensor=op.inputs[0],
+                                                             encoding_min=encoding_min, encoding_max=encoding_max,
+                                                             bitwidth=bitwidth, quant_scheme=quant_config.quant_scheme,
+                                                             op_mode=op_mode, is_symmetric=bool(is_symmetric))
+
+                    # Replace in graph
+                    # -----------------
+                    graph_editor.reroute_ts(ts0=[static_op], ts1=[op.outputs[0]],
+                                            can_modify=op.outputs[0].consumers())
+                    graph_editor.detach_inputs(op)
+
+        new_sess = graph_saver.save_and_load_graph(temp_dir_path, self.session)
+        return new_sess
 
     @staticmethod
     def _param_op_mode_after_analysis(_) -> libpymo.TensorQuantizerOpMode:
@@ -611,7 +678,7 @@ class QuantizationSimModel:
         """
         variable_dict = {}
         with self.session.graph.as_default():
-            for var in tf.global_variables():
+            for var in tf.compat.v1.global_variables():
                 if var.name.endswith('_encoding_min:0') or var.name.endswith('_encoding_max:0'):
                     variable_dict[var.name] = var
 
@@ -638,17 +705,23 @@ class QuantizationSimModel:
 
         def update_encoding_dict_entry(encoding_dict: Dict,
                                        quant_op_name: str):
-            min_val, max_val = self.read_min_max(quant_op_name, variable_dict)
-            min_val, max_val = gate_min_max(min_val, max_val)
-            op_bitwidth = int(self._get_op_variable_value(quant_op_name, int(QuantizeOpIndices.bit_width)))
-            delta, offset = calculate_delta_offset(min_val, max_val, op_bitwidth)
+
             quant_op = self.session.graph.get_operation_by_name(quant_op_name)
+            min_val, max_val = self.read_min_max(quant_op_name, variable_dict)
+
+            min_val, max_val = gate_min_max(min_val, max_val)
+            op_bitwidth = int(self._get_op_variable_value(quant_op, QuantizeOpIndices.bit_width))
+            delta, offset = calculate_delta_offset(min_val, max_val, op_bitwidth)
+            is_symmetric = str(self._get_op_variable_value(quant_op,
+                                                           QuantizeOpIndices.use_symmetric_encoding))
+
             tensor_name = quant_op.inputs[0].name
             encoding_dict[tensor_name] = [{'min': min_val,
                                            'max': max_val,
                                            'scale': delta,
                                            'offset': offset,
-                                           'bitwidth': op_bitwidth}]
+                                           'bitwidth': op_bitwidth,
+                                           'is_symmetric': is_symmetric}]
 
         param_encodings = {}
         for quant_op_name, quantizer_info in self._param_quantizers.items():
@@ -673,6 +746,61 @@ class QuantizationSimModel:
         update_tensor_quantizer_references(self.session, self._activation_quantizers)
         update_tensor_quantizer_references(self.session, self._param_quantizers)
 
+    def _add_quant_nodes_recurrent(self, graph, starting_op_names: List[str], output_op_names: List[str],
+                                   default_param_bw: int, default_output_bw: int) \
+            -> Tuple[List[str], List[int], List[str]]:
+        """
+        Utility to add quant nodes to recurrent module
+        :param graph: TensorFlow graph
+        :param starting_op_names: List of starting op names of the model
+        :param output_op_names: List of output op names of the model
+        :param default_param_bw: default param bitwidth
+        :param default_output_bw: default output bitwidth
+        :return: Tuple[List[str], List[int], List[str]], param op names, input indices and activation op names
+        """
+
+        # pylint: disable=protected-access
+        # pylint: disable=too-many-locals
+
+        # Register custom handlers to select internal ops to quantize in a given recurrent module type
+        switcher = {
+            "SimpleRNN": _select_simple_rnn_internal_ops_to_quantize,
+            "LSTM": _select_lstm_internal_ops_to_quantize
+        }
+
+        ops_with_param_names = []
+        input_indices = []
+        activation_op_names = []
+
+        conn_graph = ConnectedGraph(graph, starting_op_names, output_op_names)
+        for op in conn_graph.get_all_ops().values():
+            #  we can configure custom layer selectors per recurrent type or use default one
+            if op.type in SUPPORTED_RECURRENT_TYPES:
+
+                internal_ops = op.internal_ops
+
+                # select internal ops to quantize in this recurrent type
+                select_internal_ops_to_quantize = switcher.get(op.type)
+                module_ops_with_param_names, module_op_input_indices, module_activation_op_names = \
+                    select_internal_ops_to_quantize(self.session.graph, internal_ops)
+
+                # insert the quant nodes
+                self._insert_param_quantization_ops(module_ops_with_param_names, module_op_input_indices,
+                                                    default_param_bw, internal_ops, in_loop_context=True)
+
+                self._insert_activation_quantization_ops(module_activation_op_names, default_output_bw,
+                                                         in_loop_context=True)
+
+                # if there are multiple recurrent modules, we want a list containing all the param
+                # and activation info
+                if module_ops_with_param_names and module_op_input_indices:
+                    ops_with_param_names.extend(module_ops_with_param_names)
+                    input_indices.extend(module_op_input_indices)
+                if module_activation_op_names:
+                    activation_op_names.extend(module_activation_op_names)
+
+        return ops_with_param_names, input_indices, activation_op_names
+
     def _add_and_configure_quant_nodes(self, starting_op_names: List[str], output_op_names: List[str],
                                        default_param_bw: int, default_output_bw: int, config_file: str):
         """
@@ -685,15 +813,28 @@ class QuantizationSimModel:
         """
 
         # Get list of ops with params to insert quantizers for, as well as the input indices to insert on.
-        ops_with_param_names, input_indices = QuantizationSimModel.get_ops_to_quantize_params_for(self.session.graph)
-
-        # Get list of activation ops to insert quantizers for, and the connected graph used to obtain these ops
-        activation_op_names, conn_graph = QuantizationSimModel.get_ops_to_quantize_activations_for(self.session.graph,
+        ops_with_param_names, input_indices = QuantizationSimModel._get_ops_to_quantize_params_for(self.session.graph,
                                                                                                    starting_op_names,
                                                                                                    output_op_names)
 
+        # Get list of activation ops to insert quantizers for, and the connected graph used to obtain these ops
+        activation_op_names, conn_graph = QuantizationSimModel._get_ops_to_quantize_activations_for(self.session.graph,
+                                                                                                    starting_op_names,
+                                                                                                    output_op_names)
+
         self._insert_param_quantization_ops(ops_with_param_names, input_indices, default_param_bw)
         self._insert_activation_quantization_ops(activation_op_names, default_output_bw)
+
+        # this takes care of quant node insertion in loop context of recurrent layer, which makes a cell
+        recurrent_ops_with_param_names, recurrent_input_indices, recurrent_activation_op_names = \
+            self._add_quant_nodes_recurrent(self.session.graph, starting_op_names, output_op_names,
+                                            default_param_bw, default_output_bw)
+
+        if recurrent_ops_with_param_names and recurrent_input_indices:
+            ops_with_param_names.extend(recurrent_ops_with_param_names)
+            input_indices.extend(recurrent_input_indices)
+        if recurrent_activation_op_names:
+            activation_op_names.extend(recurrent_activation_op_names)
 
         # Note: at this point, the session used to construct conn_graph is different than the current
         # self.session, however we still use the connected graph to traverse the graph structure.
@@ -720,45 +861,39 @@ class QuantizationSimModel:
         return quant_op_name[:-len('_quantized')]
 
     @staticmethod
-    def get_ops_to_quantize_params_for(graph: tf.Graph) -> Tuple[List[str], List[int]]:
+    def _get_op_to_modify_with_param_in(op: tf.Operation, index: int) -> (tf.Operation, tf.Tensor):
         """
-        Get names of ops to insert param quantizers for, as well as corresponding indices
-        :param graph: Tensorflow graph to get names of ops to quantize weights for
-        :return: Tuple consisting of list of op names with params to insert quantize ops for as well as list of indices
-        of parameters for each op
+        utility to get op to modify along with param input
+        :param op: TensorFlow operation
+        :param index: input index to get param from
+        :return: Tuple of TF operation and param in tensor
         """
-        # Get the op query module
-        query = core.OpQuery(graph, ops_to_ignore=None)
-        ops_with_param_names = [op.name for op in query.get_weight_ops()]
-        ops_with_params = [graph.get_operation_by_name(op_name) for op_name in ops_with_param_names]
-        input_indices = query.get_weight_inputs(ops_with_params)
-        if len(ops_with_param_names) != len(input_indices):
-            _logger.error("Length of ops with params and input indices differ")
-            raise AssertionError
-        return ops_with_param_names, input_indices
 
-    @staticmethod
-    def get_ops_to_quantize_activations_for(graph: tf.Graph, starting_op_names: List[str], output_op_names: List[str])\
-            -> Tuple[List[str], ConnectedGraph]:
-        """
-        Get names of ops to insert activation quantizers for
-        :param graph: Tensorflow graph to get names of ops to quantize weights for
-        :param starting_op_names: List of starting op names of the model
-        :param output_op_names: List of output op names of the model
-        :return: List of op names to insert activation quantize ops for, and the connected graph used to obtain these
-        ops.
-        """
-        conn_graph = ConnectedGraph(graph, starting_op_names, output_op_names)
-        valid_ops = [op for op in conn_graph.get_all_ops().values() if op.type not in op_types_to_ignore]
-        op_names_to_quantize = [conn_graph_op.output_op_node.name for conn_graph_op in valid_ops]
-        return op_names_to_quantize, conn_graph
+        op_to_modify = None
+        param_in = None
+        # case of params being depth 2 input nodes to MatMul
+        # via strided-slice or split op
+        if op.inputs[index].op.type in ['StridedSlice', 'Split']:
+            strided_slice_op = op.inputs[index].op
+            for inp in strided_slice_op.inputs:
+                if inp.op.type in ['ReadVariableOp']:
+                    op_to_modify = strided_slice_op
+                    param_in = inp
+        else:
+            # case of params being direct input nodes to MatMul
+            op_to_modify = op
+            param_in = op.inputs[index]
 
-    def _insert_param_quantization_ops(self, op_names: List[str], indices: List[int], default_param_bw: int):
+        return op_to_modify, param_in
+
+    def _insert_param_quantization_ops(self, op_names: List[str], indices: List[int], default_param_bw: int,
+                                       inner_ops: List[str] = None, in_loop_context: bool = False):
         """
         Inserts quantization ops for individual parameters
         :param ops: List of ops whose parameters are being quantized
         :param indices: List of input indices (one-to-one for each entry in ops)
         :param default_param_bw : default param bitwidth
+        :param in_loop_context: True, if the ops belong to loop control flow context
         :return: None
         """
         ops = [self.session.graph.get_operation_by_name(op_name) for op_name in op_names]
@@ -766,22 +901,30 @@ class QuantizationSimModel:
 
         for op, index in zip(ops, indices):
             # Modify the weight/bias inputs to use the quantized inputs
-            param_in = op.inputs[index]
+            can_modify_op, param_in = QuantizationSimModel._get_op_to_modify_with_param_in(op, index)
 
-            quant_op_name = self._get_quantized_name(param_in.op.name)
-            _logger.info("Adding weight quantization op %s", quant_op_name)
-            op_mode = libpymo.TensorQuantizerOpMode.oneShotQuantizeDequantize
+            if param_in is not None:
+                quant_op_name = self._get_quantized_name(param_in.op.name)
+                _logger.info("Adding weight quantization op %s", quant_op_name)
+                op_mode = libpymo.TensorQuantizerOpMode.oneShotQuantizeDequantize
 
-            q_op_out = self._insert_post_training_quant_op(param_in, quant_op_name,
-                                                           op_mode, self._param_quantizers, QuantizerType.param,
-                                                           default_param_bw)
+                if in_loop_context:
+                    q_op_out = self._insert_param_quantizer_loop_context(inner_ops, param_in, quant_op_name,
+                                                                         op_mode, self._param_quantizers,
+                                                                         QuantizerType.param,
+                                                                         default_param_bw)
+                else:
+                    q_op_out = self._insert_post_training_quant_op(param_in, quant_op_name,
+                                                                   op_mode, self._param_quantizers, QuantizerType.param,
+                                                                   default_param_bw)
 
-            nodes_modified_count = graph_editor.reroute_ts(tf_ops.convert_to_tensor(q_op_out), param_in, can_modify=op)
-            if nodes_modified_count != 1:
-                raise ValueError('Input ' + param_in.name + ' not quantized!')
+                nodes_modified_count = graph_editor.reroute_ts(tf_ops.convert_to_tensor(q_op_out), param_in,
+                                                               can_modify=can_modify_op)
+                if nodes_modified_count != 1:
+                    raise ValueError('Input ' + param_in.name + ' not quantized!')
 
     @staticmethod
-    def _is_op_quantizable(op: tf.Operation)->bool:
+    def _is_op_quantizable(op: tf.Operation) -> bool:
         """
         utility to check if the quantization can be supported for this op
         :param op: op as tf.Operation type
@@ -794,11 +937,14 @@ class QuantizationSimModel:
 
         return False
 
-    def _insert_activation_quantization_ops(self, valid_op_names: List[str], default_output_bw):
+    def _insert_activation_quantization_ops(self, valid_op_names: List[str], default_output_bw,
+                                            in_loop_context: bool = False):
         """
         Inserts quantization ops at the outputs of given ops
         :param valid_op_names: List of op names to insert activation quantizers for
         :param default_output_bw: default activation bitwidth
+        :param in_loop_context: True, if the ops belong to a loop control flow context
+        return:
         """
         for op_name in valid_op_names:
             quant_op_name = self._get_quantized_name(op_name)
@@ -807,21 +953,28 @@ class QuantizationSimModel:
 
             consumers = [consumer for consumer in op.outputs[0].consumers() if 'gradients' not in consumer.name]
 
-            if QuantizationSimModel._is_op_quantizable(op):
+            if not QuantizationSimModel._is_op_quantizable(op):
+                _logger.error('Unsupported dtype {%s} detected for op {%s}.', op.outputs[0].dtype, op_name)
+                raise AssertionError
+
+            if in_loop_context:
+                q_op_out = self._insert_post_training_quant_op_in_loop_context(op.outputs[0], quant_op_name,
+                                                                               libpymo.TensorQuantizerOpMode.updateStats,
+                                                                               self._activation_quantizers,
+                                                                               QuantizerType.activation,
+                                                                               default_output_bw)
+            else:
                 q_op_out = self._insert_post_training_quant_op(op.outputs[0], quant_op_name,
                                                                libpymo.TensorQuantizerOpMode.updateStats,
                                                                self._activation_quantizers, QuantizerType.activation,
                                                                default_output_bw)
 
-                # Re-route
-                num_rerouted_outputs = graph_editor.reroute_ts(tf_ops.convert_to_tensor(q_op_out),
-                                                               op.outputs[0], can_modify=consumers)
-                if num_rerouted_outputs != len(consumers):
-                    raise ValueError('Failed to map ' + str(len(consumers)) + ' quantization output(s). Only mapped ' +
-                                     str(num_rerouted_outputs))
-            else:
-                _logger.info('Unsupported dtype {%s} detected for op {%s}, Skipping quantize op insertion',
-                             op.outputs[0].dtype, op_name)
+            # Re-route
+            num_rerouted_outputs = graph_editor.reroute_ts(tf_ops.convert_to_tensor(q_op_out),
+                                                           op.outputs[0], can_modify=consumers)
+            if num_rerouted_outputs != len(consumers):
+                raise ValueError('Failed to map ' + str(len(consumers)) + ' quantization output(s). Only mapped ' +
+                                 str(num_rerouted_outputs))
 
     def _create_encoding_min_max_vars(self, q_op_name: str) -> (tf.Variable, tf.Variable):
         """
@@ -843,6 +996,185 @@ class QuantizationSimModel:
 
         return encoding_min_var, encoding_max_var
 
+    @staticmethod
+    def _get_ops_to_quantize_params_for(graph: tf.Graph, starting_op_names: List[str], output_op_names: List[str]) \
+            -> Tuple[List[str], List[int]]:
+        """
+        Get names of ops to insert param quantizers for, as well as corresponding indices
+        :param graph: TensorFlow graph to get names of ops to quantize weights for
+        :param starting_op_names: List of starting op names of the model
+        :param output_op_names: List of output op names of the model
+        :return: Tuple consisting of list of op names with params to insert quantize ops for as well as list of indices
+        of parameters for each op
+        """
+        # Get the op query module
+        query = core.OpQuery(graph, ops_to_ignore=None)
+        valid_ops = get_valid_ops(graph, starting_op_names, output_op_names)
+        ops_with_param_names = [op.name for op in query.get_weight_ops() if op in valid_ops and
+                                op_not_in_loop_control_flow_context(graph,
+                                                                    graph.get_operation_by_name(op.name))]
+        # op's control_flow_context() will be populated for ops within conditional blocks
+        ops_with_params = [graph.get_operation_by_name(op_name) for op_name in ops_with_param_names]
+        input_indices = query.get_weight_inputs(ops_with_params)
+        if len(ops_with_param_names) != len(input_indices):
+            _logger.error("Length of ops with params and input indices differ")
+            raise AssertionError
+        return ops_with_param_names, input_indices
+
+    @staticmethod
+    def _get_ops_to_quantize_activations_for(graph: tf.Graph, starting_op_names: List[str], output_op_names: List[str]) \
+            -> Tuple[List[str], ConnectedGraph]:
+        """
+        Get names of ops to insert activation quantizers for
+        :param graph: TensorFlow graph to get names of ops to quantize weights for
+        :param starting_op_names: List of starting op names of the model
+        :param output_op_names: List of output op names of the model
+        :return: List of op names to insert activation quantize ops for, and the connected graph used to obtain these
+        ops.
+        """
+        conn_graph = ConnectedGraph(graph, starting_op_names, output_op_names)
+        valid_ops = [op for op in conn_graph.get_all_ops().values() if op.type not in op_types_to_ignore]
+        op_names_to_quantize = [conn_graph_op.output_op_node.name for conn_graph_op in valid_ops if
+                                is_op_quantizable(conn_graph_op.output_op_node)
+                                and op_not_in_loop_control_flow_context(graph, conn_graph_op.output_op_node)]
+        return op_names_to_quantize, conn_graph
+
+    def _insert_post_training_quant_op_in_loop_context(self, preceeding_tensor,
+                                                       quant_op_name: str,
+                                                       op_mode: libpymo.QuantizationMode,
+                                                       quantizer_dict: Dict[str, QuantizerInfo],
+                                                       quantizer_type: QuantizerType,
+                                                       bit_width: int = 8):
+        """
+        Create and insert a post-training quant op after a given tensor in a loop control flow context.
+        :param preceeding_tensor: Preceeding tensor to insert the quant op after
+        :param quant_op_name: Name to give to the new quant op
+        :param op_mode: Starting mode to configure for the new quant op
+        :param quantizer_dict: dictionary of op and QuantizerInfo
+        :param quantizer_type : indicate param or activation quantizer
+        :param bit_width : bit-width to be used (output or param quantization bit-width), default set to 8.
+        :return: None
+        """
+
+        # this handles cases such as conditional blocks that are defined in their own context
+        context_bk = updated_graph_flow_context_to_loop_context(self.session.graph, preceeding_tensor)
+        q_op_out = self._insert_post_training_quant_op(preceeding_tensor, quant_op_name, op_mode, quantizer_dict,
+                                                       quantizer_type, bit_width)
+
+        # revert the context back to graph level from op context
+        set_graph_flow_context(self.session.graph, context_bk)
+
+        return q_op_out
+
+    def _insert_param_quantizer_loop_context(self, inner_ops, preceeding_tensor,
+                                             quant_op_name: str,
+                                             op_mode: libpymo.QuantizationMode,
+                                             quantizer_dict: Dict[str, QuantizerInfo],
+                                             quantizer_type: QuantizerType,
+                                             bit_width: int = 8):
+        """
+        Create and insert a post-training quant op after a given tensor in a loop control flow context.
+        :param preceeding_tensor: Preceeding tensor to insert the quant op after
+        :param quant_op_name: Name to give to the new quant op
+        :param op_mode: Starting mode to configure for the new quant op
+        :param quantizer_dict: dictionary of op and QuantizerInfo
+        :param quantizer_type : indicate param or activation quantizer
+        :param bit_width : bit-width to be used (output or param quantization bit-width), default set to 8.
+        :return: None
+        """
+
+        # this handles cases such as conditional blocks that are defined in their own context
+        context_bk = updated_graph_flow_context_to_loop_context(self.session.graph, preceeding_tensor)
+        q_op_out = self._insert_param_quantizer_recurrent(inner_ops, preceeding_tensor, quant_op_name, op_mode, quantizer_dict,
+                                                          quantizer_type, bit_width)
+
+        # revert the context back to graph level from op context
+        set_graph_flow_context(self.session.graph, context_bk)
+
+        return q_op_out
+
+    def _create_and_init_quant_op_input_vars(self, quant_op_name: str, quantizer_dict: Dict[str, QuantizerInfo],
+                                             quantizer_type, op_mode: libpymo.QuantizationMode, bit_width: int = 8):
+        """
+        creates input variables to Quantize op and initializes them
+        :param quant_op_name: quantize op name
+        :param quantizer_dict: dictionary of op and QuantizerInfo
+        :param quantizer_type: indicate param or activation quantizer
+        :param op_mode: Starting mode to configure for the new quant op
+        :param bit_width: bit-width to be used (output or param quantization bit-width), default set to 8.
+        :return: quant op input variables created
+        """
+        with self.session.graph.as_default():
+            op_mode_var = tf.Variable(int(op_mode),
+                                      name=quant_op_name + '_op_mode', trainable=False,
+                                      dtype=tf.int32)
+
+            # Note: Last param of TensorQuantizer is a flag to indicate is_symmetric_encoding,
+            # this value is to be read from config file
+            tensor_quantizer = libpymo.TensorQuantizer(quant_scheme_to_libpymo[self._quant_scheme],
+                                                       libpymo.RoundingMode.ROUND_NEAREST)
+            tensor_quantizer_int64 = libpymo.PtrToInt64(tensor_quantizer)
+            tensor_quant_ref = tf.Variable(tensor_quantizer_int64, name=quant_op_name + '_quant_ref',
+                                           trainable=False, dtype=tf.int64)
+
+            # Add to quantizer dict
+            quantizer_info = QuantizerInfo(self.session, tensor_quantizer, quant_op_name, quantizer_type)
+            quantizer_dict[quant_op_name] = quantizer_info
+
+            bit_width = tf.Variable(initial_value=bit_width,
+                                    name=quant_op_name + '_bit_width',
+                                    trainable=False, dtype=tf.int8)
+
+            encoding_min, encoding_max = self._create_encoding_min_max_vars(quant_op_name)
+
+            # Note: Later, is_symmetric_encoding value is to be read from config file
+            use_symmetric_encoding = tf.Variable(initial_value=False,
+                                                 name=quant_op_name + '_use_symmetric_encoding',
+                                                 trainable=False, dtype=tf.bool)
+
+            self.session.run([op_mode_var.initializer, tensor_quant_ref.initializer, encoding_min.initializer,
+                              encoding_max.initializer, bit_width.initializer, use_symmetric_encoding.initializer])
+
+        return op_mode_var, tensor_quant_ref, encoding_min, encoding_max, bit_width, use_symmetric_encoding
+
+    def _insert_param_quantizer_recurrent(self, inner_ops, preceeding_tensor, quant_op_name: str,
+                                          op_mode: libpymo.QuantizationMode,
+                                          quantizer_dict: Dict[str, QuantizerInfo], quantizer_type: QuantizerType,
+                                          bit_width: int = 8):
+        """
+        Create and insert a post-training quant op after a given tensor
+        :param preceeding_tensor: Preceeding tensor to insert the quant op after
+        :param quant_op_name: Name to give to the new quant op
+        :param op_mode: Starting mode to configure for the new quant op
+        :param quantizer_dict: dictionary of op and QuantizerInfo
+        :param quantizer_type : indicate param or activation quantizer
+        :param bit_width : bit-width to be used (output or param quantization bit-width), default set to 8.
+        :return: None
+        """
+        # pylint: disable=too-many-locals
+        # Create variables for op_mode, tensor_quantizer_reference, encoding_min, encoding_max, bitwidth and
+        # is_symmetric_encoding flag
+        # (so we can change these in the future, if needed)
+
+        op_mode_var, tensor_quant_ref, encoding_min, encoding_max, bit_width, use_symmetric_encoding = \
+            self._create_and_init_quant_op_input_vars(quant_op_name, quantizer_dict, quantizer_type, op_mode,
+                                                      bit_width)
+
+        # extract loop cond bool variable
+        time_step_tensor = get_time_steps_tensor_from_rnn_inner_ops(inner_ops)
+
+        # CPU device assignment for QcQuantize op
+        q_op_out = self._create_and_place_recurrent_param_quantize_op(quant_op_name, preceeding_tensor,
+                                                                      op_mode_var,
+                                                                      tensor_quant_ref,
+                                                                      encoding_min,
+                                                                      encoding_max,
+                                                                      bit_width,
+                                                                      use_symmetric_encoding,
+                                                                      time_step_tensor)
+
+        return q_op_out
+
     def _insert_post_training_quant_op(self, preceeding_tensor, quant_op_name: str, op_mode: libpymo.QuantizationMode,
                                        quantizer_dict: Dict[str, QuantizerInfo], quantizer_type: QuantizerType,
                                        bit_width: int = 8):
@@ -861,36 +1193,8 @@ class QuantizationSimModel:
         # is_symmetric_encoding flag
         # (so we can change these in the future, if needed)
 
-        with self.session.graph.as_default():
-            op_mode_var = tf.Variable(int(op_mode),
-                                      name=quant_op_name + '_op_mode', trainable=False,
-                                      dtype=tf.int32)
-
-            # Note: Last param of TensorQuantizer is a flag to indicate is_symmetric_encoding,
-            # this value is to be read from config file
-            tensor_quantizer = libpymo.TensorQuantizer(quant_scheme_to_libpymo[self._quant_scheme],
-                                                       libpymo.RoundingMode.ROUND_NEAREST)
-            quantizer_info = QuantizerInfo(self.session, tensor_quantizer, quant_op_name, quantizer_type)
-            tensor_quantizer = libpymo.PtrToInt64(tensor_quantizer)
-            tensor_quant_ref = tf.Variable(tensor_quantizer, name=quant_op_name + '_quant_ref',
-                                           trainable=False, dtype=tf.int64)
-
-            bit_width = tf.Variable(initial_value=bit_width,
-                                    name=quant_op_name + '_bit_width',
-                                    trainable=False, dtype=tf.int8)
-
-            encoding_min, encoding_max = self._create_encoding_min_max_vars(quant_op_name)
-
-            # Note: Later, is_symmetric_encoding value is to be read from config file
-            use_symmetric_encoding = tf.Variable(initial_value=False,
-                                                 name=quant_op_name + '_use_symmetric_encoding',
-                                                 trainable=False, dtype=tf.bool)
-
-            self.session.run([op_mode_var.initializer, tensor_quant_ref.initializer, encoding_min.initializer,
-                              encoding_max.initializer, bit_width.initializer, use_symmetric_encoding.initializer])
-
-        # Add to quantizer dict
-        quantizer_dict[quant_op_name] = quantizer_info
+        op_mode_var, tensor_quant_ref, encoding_min, encoding_max, bit_width, use_symmetric_encoding = \
+            self._create_and_init_quant_op_input_vars(quant_op_name, quantizer_dict, quantizer_type, op_mode, bit_width)
 
         # CPU device assignment for QcQuantize op
         q_op_out = self._create_and_place_quantize_op(quant_op_name, preceeding_tensor, op_mode_var, tensor_quant_ref,
@@ -906,7 +1210,8 @@ class QuantizationSimModel:
             op = qcops.qc_quantize(name=quant_op_name, in_tensor=preceeding_tensor,
                                    op_mode=op_mode_var, tensor_quantizer_reference=tensor_quant_ref,
                                    encoding_min=encoding_min, encoding_max=encoding_max,
-                                   bit_width=bit_width, use_symmetric_encoding=use_symmetric_encoding)
+                                   bit_width=bit_width, use_symmetric_encoding=use_symmetric_encoding
+                                   )
             return op
 
         if not self._use_cuda:
@@ -919,9 +1224,32 @@ class QuantizationSimModel:
 
         return q_op_out
 
+    def _create_and_place_recurrent_param_quantize_op(self, quant_op_name: str, preceeding_tensor,
+                                                      op_mode_var: tf.Variable, tensor_quant_ref: tf.Variable,
+                                                      encoding_min: tf.Variable, encoding_max: tf.Variable,
+                                                      bit_width: tf.Variable,
+                                                      use_symmetric_encoding: tf.Variable, time_steps):
+        def create_recurrent_param_quantize_op():
+            op = qcops.qc_quantize_recurrent_param(name=quant_op_name, in_tensor=preceeding_tensor,
+                                                   op_mode=op_mode_var, tensor_quantizer_reference=tensor_quant_ref,
+                                                   encoding_min=encoding_min, encoding_max=encoding_max,
+                                                   bit_width=bit_width, use_symmetric_encoding=use_symmetric_encoding,
+                                                   time_steps=time_steps)
+            return op
+
+        if not self._use_cuda:
+            with tf.device('/cpu:0'):
+                q_op_out = create_recurrent_param_quantize_op()
+
+        # GPU device assignment for QcQuantize op
+        else:
+            q_op_out = create_recurrent_param_quantize_op()
+
+        return q_op_out
+
 
 # load and save utilities
-def update_tensor_quantizer_references(quant_sim_sess: tf.Session, quantizer_dict: Dict[str, QuantizerInfo]):
+def update_tensor_quantizer_references(quant_sim_sess: tf.compat.v1.Session, quantizer_dict: Dict[str, QuantizerInfo]):
     """
     updates the param / activation quant ops in the passed-in session with new tensor quantizer references.
     :param quant_sim_sess: tensorflow session held by quantsim object

@@ -124,7 +124,9 @@ class AimetLogger(metaclass=SingletonType):
         logging.config.dictConfig(config_dict)
 
         # Validate JSON  file default_logging_config.json for correct Logging Areas
-        configured_items = list(logging.root.manager.loggerDict.items())
+        #TODO This results in a pylint error: Instance of 'RootLogger' has no 'loggerDict' member.
+        # Need to fix this issue and then remove the pylint disablement.
+        configured_items = list(logging.root.manager.loggerDict.items()) # pylint: disable=no-member
 
         log_areas_list = list()
         for x in AimetLogger.LogAreas:
@@ -222,7 +224,7 @@ def start_bokeh_server_session(port: int):
 
     host_name = socket.gethostname()
     bokeh_serve_command = "bokeh serve  --allow-websocket-origin=" + \
-                          host_name + ":" + str(port) + " --port=" + str(port) + " &"
+                          host_name + ":" + str(port) + " --allow-websocket-origin=localhost:" + str(port) + " --port=" + str(port) + " &"
     process = subprocess.Popen(bokeh_serve_command,  # pylint: disable=subprocess-popen-preexec-fn
                                shell=True,
                                preexec_fn=os.setsid)

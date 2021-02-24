@@ -140,19 +140,20 @@ class InputChannelPruner(Pruner):
         # update the weight and bias (if any) using sub sampled input and output data
         WeightReconstructor.reconstruct_params_for_conv2d(pruned_layer, sub_sampled_inp, sub_sampled_out, output_mask)
 
-    def _sort_on_occurrence(self, sess: tf.Session, layer_comp_ratio_list: List[LayerCompRatioPair]) -> \
+    def _sort_on_occurrence(self, sess: tf.compat.v1.Session, layer_comp_ratio_list: List[LayerCompRatioPair]) -> \
             List[LayerCompRatioPair]:
         """
         Function takes session and list of conv layer-comp ratio to sort, and sorts them based on
         occurrence in the model.
 
-        :param sess: tf.Session
+        :param sess: tf.compat.v1.Session
         :param layer_comp_ratio_list: layer compression ratio list
         :return: sorted_layer_comp_ratio_List
         """
         sorted_layer_comp_ratio_list = []
 
-        ordered_ops = get_ordered_ops(graph=sess.graph, starting_op_names=self._input_op_names)
+        ordered_ops = get_ordered_ops(graph=sess.graph, starting_op_names=self._input_op_names,
+                                      output_op_names=self._output_op_names)
 
         for op in ordered_ops:
 

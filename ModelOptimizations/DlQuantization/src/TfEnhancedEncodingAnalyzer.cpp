@@ -39,6 +39,7 @@
 #include <cassert>
 #include <cstddef>
 #include <vector>
+#include <iostream>
 
 #include "DlQuantization/Quantization.hpp"
 #include "math_functions.hpp"
@@ -58,6 +59,15 @@ void TfEnhancedEncodingAnalyzer<DTYPE>::updateStats(const DTYPE* tensor, const s
 template <typename DTYPE>
 TfEncoding TfEnhancedEncodingAnalyzer<DTYPE>::computeEncoding(uint8_t bw, bool useSymmetricEncodings) const
 {
+    TfEncoding encoding = {0, 0, 0, 0, 0};
+
+    if (this->_stats.x_left.size() == 0)
+    {
+        // Histogram has not been initialized yet
+        // We return a zero encoding
+        return encoding;
+    }
+
     // Find the range of our collected stats
     DTYPE min_val, max_val;
     std::tie(min_val, max_val) = _findRangeOfAggregateStats();
@@ -81,7 +91,6 @@ TfEncoding TfEnhancedEncodingAnalyzer<DTYPE>::computeEncoding(uint8_t bw, bool u
     std::tie(best_delta, best_offset) = _findBestCandidate(bw, test_candidates);
 
     // Using the best delta and offset, calculate the encoding.
-    TfEncoding encoding;
     encoding.delta  = best_delta;
     encoding.offset = best_offset;
     encoding.bw     = bw;
@@ -112,6 +121,7 @@ TfEnhancedEncodingAnalyzer<DTYPE>::_findBestCandidate(uint8_t bw,
         std::tie(test_delta, test_offset) = candidate;
 
         DTYPE cost = _quantAndSatCost(_stats, bw, test_delta, test_offset);
+
         // Remember the best encoding.
         if (cost < best_cost)
         {
@@ -125,12 +135,41 @@ TfEnhancedEncodingAnalyzer<DTYPE>::_findBestCandidate(uint8_t bw,
 }
 
 template <typename DTYPE>
-void TfEnhancedEncodingAnalyzer<DTYPE>::_pickTestCandidatesAsymmetric(
-    DTYPE min_val, DTYPE max_val, DTYPE num_steps, std::vector<std::tuple<DTYPE, int>>& test_candidates) const
+bool TfEnhancedEncodingAnalyzer<DTYPE>::_clampToObservedMinMax(DTYPE observedMin, DTYPE observedMax, DTYPE numSteps,
+                                                               DTYPE& testDelta, int& testOffset) const
 {
+    // Calculate observed delta and offset
+    DTYPE testMin = testDelta * testOffset;
+    DTYPE testMax = testMin + testDelta * numSteps;
+
+    if ((testMin < observedMin) && (testMax > observedMax))
+    {
+        return false;
+    }
+
+    testMin = std::max(observedMin, testMin);
+    testMax = std::min(observedMax, testMax);
+
+    // Recalculate the test delta and offset
+    testDelta = (testMax - testMin) / numSteps;
+    testOffset = round(testMin / testDelta);
+
+    return true;
+}
+
+template <typename DTYPE>
+void TfEnhancedEncodingAnalyzer<DTYPE>::_pickTestCandidatesAsymmetric(
+    DTYPE observedMin, DTYPE observedMax, DTYPE numSteps, std::vector<std::tuple<DTYPE, int>>& test_candidates) const
+{
+    // Map observedMin and observedMax to grid points
+    DTYPE observedDelta = (observedMax - observedMin) / numSteps;
+    int observedOffset = round(observedMin / observedDelta);
+    observedMin = observedDelta * observedOffset;
+    observedMax = observedMin + observedDelta * numSteps;
+
     // Compute the largest TF delta which would make sense, based on the range
-    // [min_val ... max_val] we just calculated.
-    DTYPE delta_max = (max_val - min_val) / num_steps;
+    // [observedMin ... observedMax] we just calculated.
+    DTYPE delta_max = observedDelta;
 
     // Compute the deltas we will test.
     // We test 17 deltas, equally spaced between 1*delta_max/16 and
@@ -139,16 +178,23 @@ void TfEnhancedEncodingAnalyzer<DTYPE>::_pickTestCandidatesAsymmetric(
     // delta_max might not be able to fully cover the whole range.
     for (DTYPE f = 1.0 / 16; f <= 1 + 1.0 / 16; f += 1.0 / 16)
     {
-        DTYPE test_delta = f * delta_max;
+        DTYPE testDelta = f * delta_max;
 
         // Compute the offsets we will test.
         // We consider 20 different offsets, equally spaced from -255 to 0.
         for (int i = 0; i <= 20; ++i)
         {
-            int test_offset = -num_steps + num_steps / 20.0 * i;
-            test_candidates.push_back(std::tuple<DTYPE, int>(test_delta, test_offset));
+            int testOffset = -numSteps + numSteps / 20.0 * i;
+
+            // Clamp test candidates to the observedMin and observedMax range.
+            if (!_clampToObservedMinMax(observedMin, observedMax, numSteps, testDelta, testOffset))
+                continue;
+            test_candidates.push_back(std::tuple<DTYPE, int>(testDelta, testOffset));
         }
     }
+
+    // Add one candidate corresponding to the observed max and min
+    test_candidates.push_back(std::tuple<DTYPE, int>(observedDelta, observedOffset));
 }
 
 template <typename DTYPE>
@@ -157,8 +203,25 @@ void TfEnhancedEncodingAnalyzer<DTYPE>::_pickTestCandidatesSymmetric(
 {
     // Compute the largest TF delta which would make sense, based on the range
     // [min_val ... max_val] we just calculated.
-    DTYPE absolute_max = std::max(std::abs(max_val), std::abs(min_val));
-    DTYPE delta_max    = (2 * absolute_max) / num_steps;
+
+    DTYPE delta_max = 0.0;
+    int test_offset = 0;
+
+    if (min_val == 0.0)
+    {
+        // Special case for symmetric encodings. If all values are positive or 0, we can treat the
+        // symmetric encodings as unsigned
+        delta_max = max_val / num_steps;
+        test_offset = 0;        // Indicates all positive values
+    }
+    else
+    {
+        DTYPE absolute_max = std::max(std::abs(max_val), std::abs(min_val));
+        delta_max    = (2 * absolute_max) / num_steps;
+
+        // Compute the offset - since we are finding symmetric candidates, offset can be computed given the delta
+        test_offset = -(num_steps / 2);
+    }
 
     // Compute the deltas we will test.
     // We test 101 deltas, equally spaced between 1*delta_max/100 and
@@ -168,10 +231,6 @@ void TfEnhancedEncodingAnalyzer<DTYPE>::_pickTestCandidatesSymmetric(
     for (DTYPE f = 1.0 / 100; f <= 1 + 1.0 / 100; f += 1.0 / 100)
     {
         DTYPE test_delta = f * delta_max;
-
-        // Compute the offset - since we are finding symmetric candidates, offset can be computed given the delta
-        int test_offset = -(num_steps / 2);
-
         test_candidates.push_back(std::tuple<DTYPE, int>(test_delta, test_offset));
     }
 }

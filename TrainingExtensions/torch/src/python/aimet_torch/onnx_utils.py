@@ -46,8 +46,8 @@ import onnx
 
 from aimet_common.utils import AimetLogger
 import aimet_torch.utils
-from aimet_torch.defs import PassThroughOp
-
+import aimet_torch.elementwise_ops as elementwise_ops
+from aimet_torch.defs import PassThroughOp, OpToIOTensors
 
 _logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Utils)
 
@@ -62,10 +62,24 @@ map_torch_types_to_onnx = {
     nn.Linear: ['Gemm', 'MatMul'],
     nn.AdaptiveAvgPool2d: ['GlobalAveragePool', 'AveragePool'],
     nn.AvgPool2d: ['AveragePool'],
-    nn.LogSoftmax: ['LogSoftmax']
+    nn.LogSoftmax: ['LogSoftmax'],
+    nn.RNN:  ['RNN'],
+    nn.LSTM: ['LSTM'],
+    nn.GRU: ['GRU'],
+    nn.ConvTranspose2d: ['ConvTranpose'],
+    nn.Sigmoid: ['Sigmoid'],
+    nn.Upsample: ['Upsample'],
+    elementwise_ops.Add: ['Add'],
+    elementwise_ops.Subtract: ['Subtract'],
+    elementwise_ops.Multiply: ['Multiply'],
+    elementwise_ops.Divide: ['Divide'],
+    elementwise_ops.Concat: ['Concat']
+
 }
 
-torch_types_to_ignore = (nn.Dropout, nn.Dropout2d, PassThroughOp)
+# Define this as a list instead of tuple to allow for users to modify
+torch_types_to_ignore = [nn.Dropout, nn.Dropout2d, PassThroughOp]
+torch_recurrent_modules = (nn.RNN, nn.LSTM, nn.GRU)
 
 # List of associations between onnx types and pytorch connected graph types.
 # Multiple onnx types may be associated with a pytorch connected graph type, and vice versa.
@@ -84,18 +98,6 @@ onnx_pytorch_conn_graph_type_pairs = [
 ]
 
 
-class OnnxNodeIOTensors:
-    """
-    Data class to store the input and output tensor names of an ONNX node as a lists.
-    """
-    def __init__(self, node_inputs: List[str], node_outputs: List[str]):
-        """
-        :param node_inputs: name of inputs to the node
-        :param node_outputs: name of output from the node
-        """
-
-        self.inputs = node_inputs
-        self.outputs = node_outputs
 
 class OnnxSaver:
     """
@@ -104,14 +106,13 @@ class OnnxSaver:
 
     @classmethod
     def set_node_names(cls, onnx_model_path: str, pytorch_model: torch.nn.Module,
-                       input_shape: Union[Tuple, List[Tuple]]):
+                       dummy_input: Union[torch.Tensor, Tuple]):
         """
         This utility loads a given onnx model file and set the names of all the nodes (ops) to equivalent
         pytorch module names given the corresponding pytorch model.
         :param onnx_model_path: Path to the ONNX model file
         :param pytorch_model: Equivalent PyTorch model instance
-        :param input_shape: Shape of the input to the model
-                            (a tuple for 1 input and a list of tuples for multiple inputs)
+        :param dummy_input: Dummy input to the model. Used to parse model graph.
         :return:
         """
 
@@ -125,7 +126,7 @@ class OnnxSaver:
 
         # Find corresponding pytorch nodes for every ONNX node
         # and set the name of the ONNX nodes to the names of the corresponding PyTorch modules
-        cls.map_onnx_nodes_to_pytorch(pytorch_model, input_shape, ordered_list_of_nodes)
+        cls.map_onnx_nodes_to_pytorch(pytorch_model, dummy_input, ordered_list_of_nodes)
 
         # Save back the onnx model file
         onnx.save(onnx_model, onnx_model_path)
@@ -182,21 +183,33 @@ class OnnxSaver:
         return ordered_nodes_no_duplicates
 
     @staticmethod
-    def map_onnx_nodes_to_pytorch(torch_model: nn.Module, input_shape: Union[Tuple, List[Tuple]],
+    def get_num_onnx_nodes_to_map(module: nn.Module):
+        """
+        Get the number of onnx nodes that map to the same torch module
+        :param module: PyTorch model instance
+        :return: number of onnx nodes:
+        """
+        if isinstance(module, torch_recurrent_modules):
+            return module.num_layers
+        return 1
+
+    @staticmethod
+    def map_onnx_nodes_to_pytorch(torch_model: nn.Module, dummy_input: Union[torch.Tensor, Tuple],
                                   onnx_ordered_list: List[onnx.NodeProto]):
         """
         Find the ONNX node that corresponds to each PyTorch module. And sets the name of the ONNX mode to that of the
         PyTorch module
         :param torch_model: PyTorch model instance
-        :param input_shape: Shape of input(s) to the model
+        :param dummy_input: Dummy input to the model. Used to parse model graph.
         :param onnx_ordered_list: An ordinally-ordered list of ONNX nodes
         :return:
         """
-        torch_ordered_list = aimet_torch.utils.get_ordered_list_of_modules(torch_model, input_shape)
+        torch_ordered_list = aimet_torch.utils.get_ordered_list_of_modules(torch_model, dummy_input)
 
         torch_index = 0
         onnx_index = 0
 
+        num_onnx_nodes_to_map_to_same_torch_node = 0
         while torch_index < len(torch_ordered_list):
             # If few PyTorch ops are not mapped to ONNX ops
             if onnx_index >= len(onnx_ordered_list):
@@ -205,14 +218,20 @@ class OnnxSaver:
                 break
             name, module = torch_ordered_list[torch_index]
 
-            if isinstance(module, torch_types_to_ignore):
+            if isinstance(module, tuple(torch_types_to_ignore)):
                 torch_index += 1
                 continue
 
             if onnx_ordered_list[onnx_index].op_type in map_torch_types_to_onnx[type(module)]:
                 _logger.debug('Found a match: %r -> %r', onnx_ordered_list[onnx_index].op_type, name)
                 onnx_ordered_list[onnx_index].name = name
-                torch_index += 1
+
+                if num_onnx_nodes_to_map_to_same_torch_node == 0:
+                    num_onnx_nodes_to_map_to_same_torch_node = OnnxSaver.get_num_onnx_nodes_to_map(module)
+
+                num_onnx_nodes_to_map_to_same_torch_node = num_onnx_nodes_to_map_to_same_torch_node - 1
+                if num_onnx_nodes_to_map_to_same_torch_node == 0:
+                    torch_index += 1
 
             onnx_index += 1
 
@@ -267,9 +286,12 @@ class OnnxSaver:
         return True
 
     @staticmethod
-    def get_onnx_node_to_io_tensor_names_map(onnx_model: onnx.NodeProto) -> (Dict[str, OnnxNodeIOTensors], set):
+    def get_onnx_node_to_io_tensor_names_map(onnx_model: onnx.NodeProto) -> \
+            (Dict[str, Union[OpToIOTensors, List[OpToIOTensors]]], set):
         """
         Given an ONNX model, gets the inputs and output tensor names for each node in the model.
+        if multiple onnx nodes have the same name then the nodes are provided as a list of inputs and output tensor
+         names, one for each onnx node.
         :param onnx_model: The ONNX model instance
         :return: Dictionary of ONNX node name and corresponding input and output tensor names and a set with all valid
         param names in model
@@ -280,7 +302,26 @@ class OnnxSaver:
 
         for node in onnx_model.graph.node:
             if node.name:
-                node_to_io_tensor_name_map[node.name] = OnnxNodeIOTensors(list(node.input), list(node.output))
+                onnx_node_io_tensors = OpToIOTensors(list(node.input), list(node.output))
+                if node.name not in node_to_io_tensor_name_map:
+                    node_to_io_tensor_name_map[node.name] = onnx_node_io_tensors
+                else:
+                    # get the torch module associate with the onnx node
+                    torch_module = [module for module, onnx_nodes in map_torch_types_to_onnx.items()
+                                    if node.op_type in onnx_nodes]
+                    assert len(torch_module) == 1
+                    # Check if the torch module corresponding to tonnx node generates many to one mapping
+                    if torch_module[0] not in torch_recurrent_modules:
+                        # onnx module is being reused in the model pick the last entry
+                        node_to_io_tensor_name_map[node.name] = onnx_node_io_tensors
+                        continue
+
+                    # if an entry with a single IOTensors exists then convert the entry to a list
+                    if not isinstance(node_to_io_tensor_name_map[node.name], list):
+                        node_to_io_tensor_name_map[node.name] = [node_to_io_tensor_name_map[node.name],
+                                                                 onnx_node_io_tensors]
+                    else:
+                        node_to_io_tensor_name_map[node.name].append(onnx_node_io_tensors)
 
             # update valid params list
             for input_tensor in list(node.input):

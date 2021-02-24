@@ -61,7 +61,7 @@ def cross_layer_equalization_auto_stepwise():
     # load a model
     tf.keras.backend.clear_session()
     _ = ResNet50(weights='imagenet', input_shape=(224, 224, 3))
-    sess = tf.keras.backend.get_session()
+    sess = tf.compat.v1.keras.backend.get_session()
 
     # get starting op name to invoke api for cle
     start_op_name = 'input_1'
@@ -90,7 +90,7 @@ def cross_layer_equalization_auto():
     # load a model
     tf.keras.backend.clear_session()
     _ = ResNet50(weights='imagenet', input_shape=(224, 224, 3))
-    sess = tf.keras.backend.get_session()
+    sess = tf.compat.v1.keras.backend.get_session()
 
     # get starting op name to invoke api for cle
     input_op_name = 'input_1'
@@ -104,10 +104,10 @@ def cross_layer_equalization_auto():
     sess.close()
 
 
-def get_layer_pairs_Resnet50_for_folding(sess: tf.Session):
+def get_layer_pairs_Resnet50_for_folding(sess: tf.compat.v1.Session):
     """
     Helper function to pick example conv-batchnorm layer pairs for folding.
-    :param sess: tensorflow session as tf.Session
+    :param sess: tensorflow session as tf.compat.v1.Session
     :return: pairs of conv and batchnorm layers for batch norm folding in Resnet50 model.
     """
 
@@ -131,10 +131,10 @@ def get_layer_pairs_Resnet50_for_folding(sess: tf.Session):
     return layer_pairs
 
 
-def get_consecutive_layer_list_from_resnet50_for_scaling(sess: tf.Session):
+def get_consecutive_layer_list_from_resnet50_for_scaling(sess: tf.compat.v1.Session):
     """
     helper function to pick example consecutive layer list for scaling.
-    :param sess: tf.Session
+    :param sess: tf.compat.v1.Session
     :return: sample layers for scaling as consecutive_layer_list from Resnet50 model
     """
     conv1_op = sess.graph.get_operation_by_name('res2a_branch2a/Conv2D')
@@ -150,7 +150,7 @@ def get_consecutive_layer_list_from_resnet50_for_scaling(sess: tf.Session):
 def format_info_for_high_bias_fold(sess, layer_pairs, consecutive_layer_list, scaling_factor_list):
     """
      Helper function that formats data from cross layer scaling and bn fold for usage by high bias fold.
-    :param sess: tf.Session type
+    :param sess: tf.compat.v1.Session type
     :param layer_pairs: info obtained after batchnorm fold.
     :param consecutive_layer_list: info obtained after cross layer scaling
     :param scaling_factor_list: scaling params corresponding to consecutive_layer_list
@@ -162,9 +162,9 @@ def format_info_for_high_bias_fold(sess, layer_pairs, consecutive_layer_list, sc
     for (conv_op, bn_op_with_meta, _fold_upstream_flag) in layer_pairs:
         folded_pairs.append((conv_op, bn_op_with_meta.op))
 
-    # Find if there were relu activations between layers of each cross layer scaling set
-    graph_search = GraphSearchUtils(sess.graph, "input_1", "fc1000/Softmax")
-    is_relu_activation_in_cls_sets = graph_search.is_relu_activation_present_in_cls_sets(consecutive_layer_list)
+    # List that hold a boolean for if there were relu activations between layers of each cross layer scaling set
+    is_relu_activation_in_cls_sets = []
+    # Note the user is expected to fill in this list manually
 
     # Convert to a list of cls-set-info elements
     cls_set_info_list = CrossLayerScaling.create_cls_set_info_list(consecutive_layer_list,
@@ -183,7 +183,7 @@ def cross_layer_equalization_manual():
     # load a model
     tf.keras.backend.clear_session()
     _ = ResNet50(weights='imagenet', input_shape=(224, 224, 3))
-    sess = tf.keras.backend.get_session()
+    sess = tf.compat.v1.keras.backend.get_session()
 
     with sess.as_default():
         # Batch Norm Fold
@@ -222,7 +222,7 @@ def bias_correction_single_layer_empirical(dataset: tf.data.Dataset):
     # load a model
     tf.keras.backend.clear_session()
     _ = ResNet50(weights='imagenet', input_shape=(224, 224, 3))
-    sess = tf.keras.backend.get_session()
+    sess = tf.compat.v1.keras.backend.get_session()
 
     # input parameters for bias correction
     # populate required parameters in two data types QuantParams and BiasCorrectParams
@@ -240,7 +240,8 @@ def bias_correction_single_layer_empirical(dataset: tf.data.Dataset):
 
     with sess.as_default():
         # initialize model with zero bias
-        sess = BiasUtils.initialize_model_with_bias(sess)
+        sess = BiasUtils.initialize_model_with_bias(sess, bias_correction_params.input_op_names,
+                                                    bias_correction_params.output_op_names)
 
         # pick a layer for bias correction
         example_conv_layer = sess.graph.get_operation_by_name('res2a_branch2a/Conv2D')
@@ -261,7 +262,7 @@ def bias_correction_single_layer_analytical():
     # load a model
     tf.keras.backend.clear_session()
     _ = ResNet50(weights='imagenet', input_shape=(224, 224, 3))
-    sess = tf.keras.backend.get_session()
+    sess = tf.compat.v1.keras.backend.get_session()
 
     # input parameters for bias correction
     # populate required parameters in two data types QuantParams and BiasCorrectParams
@@ -273,7 +274,7 @@ def bias_correction_single_layer_analytical():
 
     with sess.as_default():
         # initialize model with zero bias
-        sess = BiasUtils.initialize_model_with_bias(sess)
+        sess = BiasUtils.initialize_model_with_bias(sess, ['input_1'], ['fc1000/Softmax'])
 
         # pick a layer for bias correction
         example_conv_layer = sess.graph.get_operation_by_name('res2a_branch2a/Conv2D')
@@ -306,7 +307,7 @@ def bias_correction_empirical(dataset: tf.data.Dataset):
     # load a model
     tf.keras.backend.clear_session()
     _ = ResNet50(weights='imagenet', input_shape=(224, 224, 3))
-    sess = tf.keras.backend.get_session()
+    sess = tf.compat.v1.keras.backend.get_session()
 
     # input parameters for bias correction
     # populate required parameters in two data types QuantParams and BiasCorrectParams
@@ -338,7 +339,7 @@ def bias_correction_empirical_analytical(dataset: tf.data.Dataset):
     # load a model
     tf.keras.backend.clear_session()
     _ = ResNet50(weights='imagenet', input_shape=(224, 224, 3))
-    sess = tf.keras.backend.get_session()
+    sess = tf.compat.v1.keras.backend.get_session()
 
     # input parameters for bias correction
     # populate required parameters in two data types QuantParams and BiasCorrectParams
@@ -373,7 +374,7 @@ def bias_correction_after_cle(dataset: tf.data.Dataset):
     # load a model
     tf.keras.backend.clear_session()
     _ = ResNet50(weights='imagenet', input_shape=(224, 224, 3))
-    sess = tf.keras.backend.get_session()
+    sess = tf.compat.v1.keras.backend.get_session()
 
     # input parameters for bias correction
     # populate required parameters in two data types QuantParams and BiasCorrectParams

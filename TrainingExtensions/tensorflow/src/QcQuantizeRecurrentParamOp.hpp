@@ -2,7 +2,7 @@
 //
 //  @@-COPYRIGHT-START-@@
 //
-//  Copyright (c) 2016-2017, Qualcomm Innovation Center, Inc. All rights reserved.
+//  Copyright (c) 2020, Qualcomm Innovation Center, Inc. All rights reserved.
 //
 //  Redistribution and use in source and binary forms, with or without
 //  modification, are permitted provided that the following conditions are met:
@@ -36,41 +36,16 @@
 //
 //==============================================================================
 
-#ifndef PACK_FUNCTIONS_HPP_
-#define PACK_FUNCTIONS_HPP_
+#ifndef QC_QUANTIZE_RECURRENT_PARAM_OP_HPP
+#define QC_QUANTIZE_RECURRENT_PARAM_OP_HPP
 
-#include <vector>
+#include "tensorflow/core/framework/op.h"
+#include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/shape_inference.h"
+#include "tensorflow/core/platform/logging.h"
 
-namespace DlCompression
-{
-/**
- * @brief Pack data into compressed format.
- * @param unpackedData The data to be packed.
- * @param packedData Compute the packed byte array such that every bit is used
- * to represent the original data (apart from trailing padding bits at the very
- * end of the vector).
- * @param bw Each item in 'unpackedData' gets packed using this bit-width.
- *
- * Note this function does support bit-widths which are not integer power of 2.
- * The following bit-widths are supported: 1, 2, ..., 7, 8, 16, 32.
- */
-void packData(const std::vector<unsigned int>& unpackedData, std::vector<uint8_t>& packedData, unsigned int bw);
+#include <DlQuantization/TensorQuantizerOpFacade.h>
+#include <DlQuantization/Quantization.hpp>
 
-/**
- * @brief Unpack data from compressed format.
- * @param packedData The packed byte array such that every bit is used
- * to represent the original data (apart from trailing padding bits at the very
- * end of the vector).
- * @param packedDataCnt The number of items in 'packedData'.
- * @param unpackedData Unpack the data.
- * @param bw Each item in 'packedData' is represented using this bit-width.
- *
- * Note this function does support bit-widths which are not integer power of 2.
- * The following bit-widths are supported: 1, 2, ..., 7, 8, 16, 32.
- */
-void unpackData(const std::vector<uint8_t>& packedData, unsigned int packedDataCnt,
-                std::vector<unsigned int>& unpackedData, unsigned int bw);
 
-}   // End of namespace DlCompression
-
-#endif   // PACK_FUNCTIONS_HPP_
+#endif   // QC_QUANTIZE_RECURRENT_PARAM_OP_HPP

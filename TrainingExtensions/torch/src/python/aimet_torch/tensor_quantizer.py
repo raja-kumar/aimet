@@ -40,7 +40,10 @@
 import io
 from typing import Union
 
+import torch
+
 from aimet_common.defs import QuantScheme
+import aimet_torch.quantsim_straight_through_grad as ste
 import libpymo
 import AimetTensorQuantizer
 
@@ -103,6 +106,7 @@ class PostTrainingTensorQuantizer(TensorQuantizer):
                                                           enabled_by_default)
         self._cppOp = AimetTensorQuantizer.AimetTensorQuantizer(quant_scheme)
         self.encoding = None
+        self.is_encoding_frozen = False
 
     def __str__(self):
         stream = io.StringIO(newline='\n')
@@ -154,17 +158,15 @@ class PostTrainingTensorQuantizer(TensorQuantizer):
         """
         Update the stats for computing encoding
         :param tensor: Tensor to use for updating the encodings stats
-        :return: None
         """
-        if self.enabled:
+        if self.enabled and not self.is_encoding_frozen:
             self._cppOp.updateStats(tensor, tensor.is_cuda)
 
     def compute_encoding(self):
         """
         Compute the quantization encoding for this tensor
-        :return:
         """
-        if self.enabled:
+        if self.enabled and not self.is_encoding_frozen:
             encoding, is_encoding_valid = self._cppOp.getEncoding(self.bitwidth, self.use_symmetric_encodings)
 
             if is_encoding_valid:
@@ -177,16 +179,65 @@ class PostTrainingTensorQuantizer(TensorQuantizer):
         :param round_mode: Rounding mode
         :return: Resulting tensor
         """
-        if self.enabled:
-            quantized_tensor = self._cppOp.quantizeDequantize(tensor, self.encoding, round_mode, tensor.is_cuda)
-        else:
-            quantized_tensor = tensor
-
-        return quantized_tensor
+        output = QuantizeDequantize.apply(tensor, self, round_mode)
+        return output
 
     def reset_encoding_stats(self):
         """
-        Resets the encodings stats
-        :return: None
+        Resets the encodings stats and set encoding to None
         """
-        self._cppOp.resetEncodingStats()
+        if not self.is_encoding_frozen:
+            self._cppOp.resetEncodingStats()
+            self.encoding = None
+
+    def freeze_encoding(self):
+        """
+        Freeze the encoding
+        """
+        self.is_encoding_frozen = True
+
+    def set_encoding(self, encoding: libpymo.TfEncoding):
+        """
+        Set the encoding
+        :param encoding: Encoding to be set
+        """
+        self.encoding = encoding
+
+
+class QuantizeDequantize(torch.autograd.Function):
+    """
+    Custom gradient function for STE
+    """
+    # pylint:disable = arguments-differ
+    @staticmethod
+    def forward(ctx, tensor, tensor_quantizer, round_mode):
+        """
+        Quantize-dequantize the tensor, using the saved encoding for this tensor
+        :param tensor: Tensor to quantize-dequantize
+        :param tensor_quantizer: Reference to the tensor quantizer
+        :param round_mode: Rounding mode
+        :return: Resulting tensor
+        """
+        if tensor_quantizer.enabled:
+            # pylint:disable = protected-access
+            quantized_tensor = tensor_quantizer._cppOp.quantizeDequantize(tensor, tensor_quantizer.encoding,
+                                                                          round_mode, tensor.is_cuda)
+        else:
+            quantized_tensor = tensor
+
+        ctx.save_for_backward(quantized_tensor)
+
+        ctx.tensor_quantizer = tensor_quantizer
+        return quantized_tensor
+
+    @staticmethod
+    def backward(ctx, output_grad):
+        tensor = ctx.saved_tensors
+        tensor_quantizer = ctx.tensor_quantizer
+        if tensor_quantizer.enabled:
+            grad = ste.compute_dloss_by_dx(tensor[0], output_grad, tensor_quantizer.encoding.min,
+                                           tensor_quantizer.encoding.max)
+        else:
+            grad = output_grad
+
+        return grad, None, None

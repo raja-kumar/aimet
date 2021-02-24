@@ -37,7 +37,6 @@
 # =============================================================================
 
 """ Common utility for Quantization """
-import math
 
 
 def gate_min_max(min_val: float, max_val: float)-> (float, float):
@@ -70,5 +69,5 @@ def calculate_delta_offset(min_val: float, max_val: float, bitwidth: int)-> (flo
     delta = (max_val - min_val) / (2 ** bitwidth - 1)
     if delta == 0:
         delta = 1e-5
-    offset = math.floor(-min_val / delta)
+    offset = round(min_val / delta)
     return delta, offset

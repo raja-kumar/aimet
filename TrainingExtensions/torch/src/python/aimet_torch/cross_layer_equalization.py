@@ -47,7 +47,7 @@ from typing import Tuple, List, Union, Dict
 import numpy as np
 import torch
 
-import libpymo
+import libpymo      # pylint: disable=import-error
 
 from aimet_torch import utils
 from aimet_torch.meta.connectedgraph import ConnectedGraph
@@ -107,9 +107,9 @@ class GraphSearchUtils:
     """
 
     def __init__(self, model: torch.nn.Module, input_shapes: Union[Tuple, List[Tuple]]):
-        inp_tensor_list = utils.create_rand_tensors_given_shapes(input_shapes)
+        inp_tensor_list = tuple(utils.create_rand_tensors_given_shapes(input_shapes))
         self._connected_graph = ConnectedGraph(model, inp_tensor_list)
-        self._ordered_module_list = utils.get_ordered_list_of_conv_modules(model, input_shapes)
+        self._ordered_module_list = utils.get_ordered_list_of_conv_modules(model, inp_tensor_list)
 
     @staticmethod
     def find_downstream_layer_groups_to_scale(op, layer_groups, current_group=None, visited_nodes=None):
@@ -138,6 +138,7 @@ class GraphSearchUtils:
 
         # Terminating condition for current group
         if not op.model_module or not isinstance(op.model_module.get_module(), (torch.nn.Conv2d, torch.nn.ReLU,
+                                                                                torch.nn.PReLU,
                                                                                 torch.nn.ConvTranspose2d)):
             if (len(current_group) > 1) and (current_group not in layer_groups):
                 layer_groups.append(current_group)
@@ -216,7 +217,7 @@ class GraphSearchUtils:
             if op.model_module and op.model_module.get_module() is module:
                 assert len(op.output.consumers) == 1
                 is_relu_activation = isinstance(op.output.consumers[0].model_module.get_module(),
-                                                torch.nn.ReLU)
+                                                (torch.nn.ReLU, torch.nn.PReLU))
                 return is_relu_activation
 
         return False
@@ -371,10 +372,10 @@ class CrossLayerScaling:
                         Second Conv layer is a depth-wise conv and third conv layer is point-wise conv
         :return: Scaling factors S_12 and S_23 : numpy arrays
         """
-
+        # pylint:disable=too-many-branches
         on_gpu = False
         for module in cls_set:
-            if not isinstance(module, torch.nn.Conv2d):
+            if not isinstance(module, (torch.nn.Conv2d, torch.nn.ConvTranspose2d)):
                 raise ValueError("Only conv layers are supported for cross layer equalization")
             if module.weight.is_cuda:
                 on_gpu = True
@@ -384,6 +385,12 @@ class CrossLayerScaling:
         prev_layer_params = libpymo.EqualizationParams()
         curr_layer_params = libpymo.EqualizationParams()
         next_layer_params = libpymo.EqualizationParams()
+
+        if isinstance(cls_set[0], torch.nn.ConvTranspose2d):
+            cls_set[0].weight.data = cls_set[0].weight.data.permute(1, 0, 2, 3)
+        if isinstance(cls_set[2], torch.nn.ConvTranspose2d):
+            cls_set[2].weight.data = cls_set[2].weight.data.permute(1, 0, 2, 3)
+        assert cls_set[1].groups > 1
 
         prev_layer_params.weight = cls_set[0].weight.detach().numpy().flatten()
         prev_layer_params.weightShape = np.array(cls_set[0].weight.shape)
@@ -409,6 +416,8 @@ class CrossLayerScaling:
         cls_set[0].weight.data = torch.from_numpy(np.reshape(prev_layer_params.weight,
                                                              prev_layer_params.weightShape))
         cls_set[0].weight.data = cls_set[0].weight.data.type(torch.FloatTensor)
+        if isinstance(cls_set[0], torch.nn.ConvTranspose2d):
+            cls_set[0].weight.data = cls_set[0].weight.data.permute(1, 0, 2, 3)
 
         cls_set[1].weight.data = torch.from_numpy(np.reshape(curr_layer_params.weight,
                                                              curr_layer_params.weightShape))
@@ -417,6 +426,8 @@ class CrossLayerScaling:
         cls_set[2].weight.data = torch.from_numpy(np.reshape(next_layer_params.weight,
                                                              next_layer_params.weightShape))
         cls_set[2].weight.data = cls_set[2].weight.data.type(torch.FloatTensor)
+        if isinstance(cls_set[2], torch.nn.ConvTranspose2d):
+            cls_set[2].weight.data = cls_set[2].weight.data.permute(1, 0, 2, 3)
 
         if cls_set[0].bias is not None:
             cls_set[0].bias.data = torch.from_numpy(np.reshape(prev_layer_params.bias,
@@ -548,7 +559,7 @@ class HighBiasFold:
 
         weight = cls_pair_info.layer2.weight
         # Transpose weights to C, N, H, W from N, C, H, W since axis are flipped for transposed conv
-        if isinstance(cls_pair_info.layer2, torch.nn.ConvTranspose2d):
+        if isinstance(cls_pair_info.layer2, torch.nn.ConvTranspose2d) and cls_pair_info.layer2.groups == 1:
             weight = weight.permute(1, 0, 2, 3)
 
         curr_layer_params.bias = cls_pair_info.layer2.bias.detach().numpy()
@@ -583,7 +594,7 @@ class HighBiasFold:
 
                 prev_layer_bias_shape = cls_pair_info.layer1.weight.shape[0]
                 # Transpose weight back to N, C, H, W for transposed Conv2D
-                if isinstance(cls_pair_info.layer1, torch.nn.ConvTranspose2d):
+                if isinstance(cls_pair_info.layer1, torch.nn.ConvTranspose2d) and cls_pair_info.layer1.groups == 1:
                     prev_layer_bias_shape = cls_pair_info.layer1.weight.shape[1]
 
                 cls_pair_info.layer1.bias.data = torch.from_numpy(np.reshape(prev_layer_params.bias,

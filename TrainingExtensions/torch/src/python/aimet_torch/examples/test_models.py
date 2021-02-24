@@ -125,6 +125,31 @@ class MultiInput(nn.Module):
         return x
 
 
+class DictInputModel(nn.Module):
+    """ Model with dictionary as input. """
+    def __init__(self, num_classes=3):
+        super(DictInputModel, self).__init__()
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=2, stride=2, padding=3, bias=False)
+        self.conv2 = nn.Conv2d(16, 8, kernel_size=3, stride=2, padding=2)
+        self.conv3 = nn.Conv2d(3, 8, kernel_size=3, stride=2, padding=2)
+        self.bn1 = nn.BatchNorm2d(8)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=2, stride=2, padding=1)
+        self.fc = nn.Linear(288, num_classes)
+
+    def forward(self, *inputs):
+        x1 = self.conv1(inputs[0]['inp_1'])
+        x1 = self.conv2(x1)
+        x2 = self.conv3(inputs[0]['inp_2'])
+        x = x1 + x2
+        x = self.bn1(x)
+        x = self.relu1(x)
+        x = self.maxpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+
 class ConcatModel(nn.Module):
     """ A model with concat op.
         Use this model for unit testing purposes.
@@ -456,3 +481,116 @@ class ConfigurableTupleOutputModel(torch.nn.Module):
         c2 = self.conv2(inputs[1])
         c3 = self.conv3(inputs[2])
         return c1, c2, c3
+class SingleLayerRNNModel(nn.Module):
+    """
+    Model using torch.nn.RNN module
+    Expected input shape = (SEQ_LENGTH, BATCH_SIZE, INPUT_SIZE=3)
+    """
+    def __init__(self):
+        super(SingleLayerRNNModel, self).__init__()
+        self.rnn = torch.nn.RNN(input_size=3, hidden_size=5, num_layers=1)
+
+    # pylint: disable=arguments-differ
+    def forward(self, x, hx=None):
+        return self.rnn(x, hx)
+
+
+class SingleLayerBidirectionalLstmModel(nn.Module):
+    """
+    Model using torch.nn.LSTM module
+    Expected input shape = (SEQ_LENGTH, BATCH_SIZE, INPUT_SIZE=3)
+    """
+    def __init__(self):
+        super(SingleLayerBidirectionalLstmModel, self).__init__()
+        self.lstm = torch.nn.LSTM(input_size=3, hidden_size=5, num_layers=1, bidirectional=True)
+
+    # pylint: disable=arguments-differ
+    def forward(self, x, hx=None):
+        return self.lstm(x, hx)
+
+
+class TwoLayerBidirectionalLstmModel(nn.Module):
+    """
+    Model using torch.nn.LSTM module
+    Expected input shape = (SEQ_LENGTH, BATCH_SIZE, INPUT_SIZE=3)
+    """
+    def __init__(self):
+        super(TwoLayerBidirectionalLstmModel, self).__init__()
+        self.lstm = torch.nn.LSTM(input_size=3, hidden_size=5, num_layers=2, bidirectional=True)
+
+    # pylint: disable=arguments-differ
+    def forward(self, x, hx=None):
+        return self.lstm(x, hx)
+
+
+class MultiLayerRNNModel(nn.Module):
+    """
+    Model using torch.nn.RNN module with multiple layers
+    Expected input shape = (SEQ_LENGTH, BATCH_SIZE, INPUT_SIZE=3)
+    """
+    def __init__(self):
+        super(MultiLayerRNNModel, self).__init__()
+        self.rnn = torch.nn.RNN(input_size=3, hidden_size=5, num_layers=2)
+
+    # pylint: disable=arguments-differ
+    def forward(self, x, hx=None):
+        return self.rnn(x, hx)
+
+
+class RNNCellModel(nn.Module):
+    """
+    Model using torch.nn.RNNCell module
+    Expected input shape = (SEQ_LENGTH=10, BATCH_SIZE, INPUT_SIZE=3)
+    """
+    def __init__(self):
+        super(RNNCellModel, self).__init__()
+        self.rnn_cell = torch.nn.RNNCell(input_size=3, hidden_size=5)
+
+    # pylint: disable=arguments-differ
+    def forward(self, x, hx0=None):
+        output = []
+        for i in range(x.shape[0]):
+            hx0 = self.rnn_cell(x[i], hx0)
+            output.append(hx0)
+        return tuple(output), hx0
+
+
+class LSTMModel(nn.Module):
+    """
+    Model using torch.nn.LSTM module
+    Expected input shape = (SEQ_LENGTH, BATCH_SIZE, INPUT_SIZE=3)
+    """
+    def __init__(self):
+        super(LSTMModel, self).__init__()
+        self.rnn = torch.nn.LSTM(input_size=3, hidden_size=5, num_layers=1)
+
+    # pylint: disable=arguments-differ
+    def forward(self, x, hx_cx=None):
+        return self.rnn(x, hx_cx)
+
+
+class NestedSequentialModel(nn.Module):
+    """
+    Model using nested Sequential modules
+    Expected input shape = (1, 3, 8, 8)
+    """
+    def __init__(self, num_classes=3):
+        super(NestedSequentialModel, self).__init__()
+        self.inner_seq = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=2, stride=2, padding=2, bias=False),
+            nn.BatchNorm2d(16)
+        )
+        self.seq_list = nn.Sequential(
+            self.inner_seq,
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2, padding=1),
+            nn.Conv2d(16, 8, kernel_size=2, stride=2, padding=2),
+            nn.Conv2d(8, 4, kernel_size=2, stride=2, padding=2)
+        )
+        self.fc = nn.Linear(64, num_classes)
+
+    def forward(self, *inputs):
+        x = self.seq_list(inputs[0])
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x

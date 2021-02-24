@@ -2,7 +2,7 @@
 //
 //  @@-COPYRIGHT-START-@@
 //
-//  Copyright (c) 2016-2017, Qualcomm Innovation Center, Inc. All rights reserved.
+//  Copyright (c) 2020, Qualcomm Innovation Center, Inc. All rights reserved.
 //
 //  Redistribution and use in source and binary forms, with or without
 //  modification, are permitted provided that the following conditions are met:
@@ -36,18 +36,19 @@
 //
 //==============================================================================
 
-#include <thrust/device_vector.h>
-#include <thrust/extrema.h>
-#include <thrust/functional.h>
-#include <thrust/reduce.h>
+#ifndef QC_QUANTIZE_STATIC_OP_HPP
+#define QC_QUANTIZE_STATIC_OP_HPP
 
-namespace DlCompression
-{
-void ReductionMinMax_gpu(const float* data, const int cnt, float& min, float& max)
-{
-    thrust::pair<const float*, const float*> result = thrust::minmax_element(data, data + cnt);
-    min                                             = (float) (*result.first);
-    max                                             = (float) (*result.second);
-}
+#include "tensorflow/core/framework/op.h"
+#include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/shape_inference.h"
+#include "tensorflow/core/platform/logging.h"
 
-}   // namespace DlCompression
+#include <DlQuantization/TensorQuantizerOpFacade.h>
+#include <DlQuantization/ITensorQuantizationSim.h>
+#include <DlQuantization/QuantizerFactory.hpp>
+#include <DlQuantization/TensorQuantizer.h>
+#include <DlQuantization/Quantization.hpp>
+
+
+#endif   // QC_QUANTIZE_STATIC_OP_HPP

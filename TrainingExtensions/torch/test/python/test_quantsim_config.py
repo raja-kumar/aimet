@@ -1,4 +1,3 @@
-# /usr/bin/env python2.7
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -36,7 +35,7 @@
 #  @@-COPYRIGHT-END-@@
 # =============================================================================
 """ Module for testing quantsim config feature """
-import unittest
+import pytest
 import json
 import os
 import torch
@@ -50,7 +49,7 @@ from aimet_torch.meta.connectedgraph import ConnectedGraph
 
 
 # pylint: disable=protected-access
-class TestQuantsimConfig(unittest.TestCase):
+class TestQuantsimConfig:
     """ Class containing unit tests for quantsim config feature """
 
     def test_parse_config_file_defaults(self):
@@ -80,21 +79,21 @@ class TestQuantsimConfig(unittest.TestCase):
 
         sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced,
                                    config_file='./data/quantsim_config.json',
-                                   input_shapes=(1, 3, 32, 32), in_place=True)
+                                   dummy_input=torch.rand(1, 3, 32, 32), in_place=True)
         for name, module in sim.model.named_modules():
             if isinstance(module, QcQuantizeWrapper):
                 # Output of add op is input quantized
                 if name == 'relu3':
-                    self.assertTrue(module.input_quantizer.enabled)
+                    assert module.input_quantizer.enabled
                 else:
-                    self.assertTrue(not module.input_quantizer.enabled)
-                self.assertTrue(module.output_quantizer.enabled)
-                self.assertTrue(not module.input_quantizer.use_symmetric_encodings)
-                self.assertTrue(not module.output_quantizer.use_symmetric_encodings)
+                    assert not module.input_quantizer.enabled
+                assert module.output_quantizers[0].enabled
+                assert not module.input_quantizer.use_symmetric_encodings
+                assert not module.output_quantizers[0].use_symmetric_encodings
                 if module.param_quantizers:
                     for _, param_quantizer in module.param_quantizers.items():
-                        self.assertTrue(not param_quantizer.enabled)
-                        self.assertTrue(param_quantizer.use_symmetric_encodings)
+                        assert not param_quantizer.enabled
+                        assert param_quantizer.use_symmetric_encodings
 
         if os.path.exists('./data/quantsim_config.json'):
             os.remove('./data/quantsim_config.json')
@@ -130,17 +129,17 @@ class TestQuantsimConfig(unittest.TestCase):
             json.dump(quantsim_config, f)
         sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced,
                                    config_file='./data/quantsim_config.json',
-                                   input_shapes=(1, 3, 32, 32))
+                                   dummy_input=torch.rand(1, 3, 32, 32))
         for _, module in sim.model.named_modules():
             if isinstance(module, QcQuantizeWrapper):
                 if module.param_quantizers:
                     for param_name, param_quantizer in module.param_quantizers.items():
                         if param_name == 'weight':
-                            self.assertTrue(param_quantizer.enabled)
-                            self.assertTrue(not param_quantizer.use_symmetric_encodings)
+                            assert param_quantizer.enabled
+                            assert not param_quantizer.use_symmetric_encodings
                         else:
-                            self.assertTrue(not param_quantizer.enabled)
-                            self.assertTrue(param_quantizer.use_symmetric_encodings)
+                            assert not param_quantizer.enabled
+                            assert param_quantizer.use_symmetric_encodings
         if os.path.exists('./data/quantsim_config.json'):
             os.remove('./data/quantsim_config.json')
 
@@ -181,30 +180,30 @@ class TestQuantsimConfig(unittest.TestCase):
             json.dump(quantsim_config, f)
         sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced,
                                    config_file='./data/quantsim_config.json',
-                                   input_shapes=(1, 3, 32, 32))
+                                   dummy_input=torch.rand(1, 3, 32, 32))
         for name, module in sim.model.named_modules():
             if isinstance(module, QcQuantizeWrapper):
                 if isinstance(module._module_to_wrap, torch.nn.Conv2d):
-                    self.assertTrue(module.input_quantizer.enabled)
-                    self.assertTrue(not module.input_quantizer.use_symmetric_encodings)
-                    self.assertTrue(not module.output_quantizer.use_symmetric_encodings)
+                    assert module.input_quantizer.enabled
+                    assert not module.input_quantizer.use_symmetric_encodings
+                    assert not module.output_quantizers[0].use_symmetric_encodings
                 else:
                     # Output of add op is input quantized
                     if name == 'relu3':
-                        self.assertTrue(module.input_quantizer.enabled)
+                        assert module.input_quantizer.enabled
                     else:
-                        self.assertTrue(not module.input_quantizer.enabled)
-                    self.assertTrue(module.output_quantizer.enabled)
-                    self.assertTrue(not module.input_quantizer.use_symmetric_encodings)
-                    self.assertTrue(not module.output_quantizer.use_symmetric_encodings)
+                        assert not module.input_quantizer.enabled
+                    assert module.output_quantizers[0].enabled
+                    assert not module.input_quantizer.use_symmetric_encodings
+                    assert not module.output_quantizers[0].use_symmetric_encodings
                 if module.param_quantizers:
                     for param_name, param_quantizer in module.param_quantizers.items():
                         if isinstance(module._module_to_wrap, torch.nn.Conv2d) and param_name == 'bias':
-                            self.assertTrue(param_quantizer.enabled)
-                            self.assertTrue(not param_quantizer.use_symmetric_encodings)
+                            assert param_quantizer.enabled
+                            assert not param_quantizer.use_symmetric_encodings
                         else:
-                            self.assertTrue(not param_quantizer.enabled)
-                            self.assertTrue(param_quantizer.use_symmetric_encodings)
+                            assert not param_quantizer.enabled
+                            assert param_quantizer.use_symmetric_encodings
         if os.path.exists('./data/quantsim_config.json'):
             os.remove('./data/quantsim_config.json')
 
@@ -245,23 +244,23 @@ class TestQuantsimConfig(unittest.TestCase):
         # Use in_place=True here for easy access to modules through model instance variables
         sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced,
                                    config_file='./data/quantsim_config.json',
-                                   in_place=True, input_shapes=(1, 3, 32, 32))
+                                   in_place=True, dummy_input=torch.rand(1, 3, 32, 32))
         for _, module in sim.model.named_modules():
             if isinstance(module, QcQuantizeWrapper):
                 # Check configs for starts of supergroups
                 if module in [model.conv1, model.relu1, model.conv2, model.conv3]:
-                    self.assertTrue(not module.output_quantizer.enabled)
+                    assert not module.output_quantizers[0].enabled
                 # Check configs for middle ops in supergroups
                 elif module == model.relu3:
-                    self.assertTrue(not module.input_quantizer.enabled)
-                    self.assertTrue(not module.output_quantizer.enabled)
+                    assert not module.input_quantizer.enabled
+                    assert not module.output_quantizers[0].enabled
                 # Check configs for ends of supergroups
                 elif module in [model.bn1, model.maxpool, model.bn2, model.avgpool]:
-                    self.assertTrue(not module.input_quantizer.enabled)
-                    self.assertTrue(module.output_quantizer.enabled)
+                    assert not module.input_quantizer.enabled
+                    assert module.output_quantizers[0].enabled
                 else:
-                    self.assertTrue(not module.input_quantizer.enabled)
-                    self.assertTrue(module.output_quantizer.enabled)
+                    assert not module.input_quantizer.enabled
+                    assert module.output_quantizers[0].enabled
 
         if os.path.exists('./data/quantsim_config.json'):
             os.remove('./data/quantsim_config.json')
@@ -290,15 +289,15 @@ class TestQuantsimConfig(unittest.TestCase):
             json.dump(quantsim_config, f)
         sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced,
                                    config_file='./data/quantsim_config.json',
-                                   input_shapes=(1, 3, 32, 32))
+                                   dummy_input=torch.rand(1, 3, 32, 32))
         for name, module in sim.model.named_modules():
             if isinstance(module, QcQuantizeWrapper):
                 if name in ['conv3', 'ada']:
                     # model.conv3 and model.ada are inputs to add
-                    self.assertTrue(module.output_quantizer.enabled)
+                    assert module.output_quantizers[0].enabled
                 else:
-                    self.assertTrue(not module.output_quantizer.enabled)
-                self.assertTrue(not module.input_quantizer.enabled)
+                    assert not module.output_quantizers[0].enabled
+                assert not module.input_quantizer.enabled
         if os.path.exists('./data/quantsim_config.json'):
             os.remove('./data/quantsim_config.json')
 
@@ -324,17 +323,17 @@ class TestQuantsimConfig(unittest.TestCase):
             json.dump(quantsim_config, f)
 
         sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced, config_file='./data/quantsim_config.json',
-                                   input_shapes=[(1, 3, 32, 32), (1, 3, 20, 20)], in_place=True)
+                                   dummy_input=(torch.rand(1, 3, 32, 32), torch.rand(1, 3, 20, 20)), in_place=True)
         for name, module in sim.model.named_modules():
             if isinstance(module, QcQuantizeWrapper):
                 # Output of add op is input quantized
                 if name in ('conv1', 'conv3'):
-                    self.assertTrue(module.input_quantizer.enabled)
+                    assert module.input_quantizer.enabled
                 else:
-                    self.assertTrue(not module.input_quantizer.enabled)
-                self.assertTrue(not module.output_quantizer.enabled)
-                self.assertTrue(not module.input_quantizer.use_symmetric_encodings)
-                self.assertTrue(not module.output_quantizer.use_symmetric_encodings)
+                    assert not module.input_quantizer.enabled
+                assert not module.output_quantizers[0].enabled
+                assert not module.input_quantizer.use_symmetric_encodings
+                assert not module.output_quantizers[0].use_symmetric_encodings
 
         if os.path.exists('./data/quantsim_config.json'):
             os.remove('./data/quantsim_config.json')
@@ -360,15 +359,15 @@ class TestQuantsimConfig(unittest.TestCase):
         with open('./data/quantsim_config.json', 'w') as f:
             json.dump(quantsim_config, f)
         sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced, config_file='./data/quantsim_config.json',
-                                   input_shapes=(1, 3, 32, 32))
+                                   dummy_input=torch.rand(1, 3, 32, 32))
         for name, module in sim.model.named_modules():
             if isinstance(module, QcQuantizeWrapper):
                 if name == 'fc':
                     # model.conv3 and model.ada are inputs to add
-                    self.assertTrue(module.output_quantizer.enabled)
+                    assert module.output_quantizers[0].enabled
                 else:
-                    self.assertTrue(not module.output_quantizer.enabled)
-                self.assertTrue(not module.input_quantizer.enabled)
+                    assert not module.output_quantizers[0].enabled
+                assert not module.input_quantizer.enabled
         if os.path.exists('./data/quantsim_config.json'):
             os.remove('./data/quantsim_config.json')
 
@@ -398,13 +397,13 @@ class TestQuantsimConfig(unittest.TestCase):
             json.dump(quantsim_config, f)
         # Use in_place=True here for easy access to modules through model instance variables
         sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced, config_file='./data/quantsim_config.json',
-                                   in_place=True, input_shapes=(1, 3, 32, 32))
+                                   in_place=True, dummy_input=torch.rand(1, 3, 32, 32))
         for _, module in sim.model.named_modules():
             if isinstance(module, QcQuantizeWrapper):
                 # Check configs for starts of supergroups
                 if module == model.relu3:
                     # If add were not part of the supergroup, relu's input quantizer would be enabled
-                    self.assertTrue(not module.input_quantizer.enabled)
+                    assert not module.input_quantizer.enabled
 
         if os.path.exists('./data/quantsim_config.json'):
             os.remove('./data/quantsim_config.json')
@@ -421,12 +420,12 @@ class TestQuantsimConfig(unittest.TestCase):
         add_10_op = conn_graph.get_all_ops()['add_10']
         adaptive_avg_pool2d_9_op = conn_graph.get_all_ops()['adaptive_avg_pool2d_9']
         neighborhood = _get_all_ops_in_neighborhood(starting_op, 'output')
-        self.assertEqual(3, len(neighborhood))
-        self.assertTrue(starting_op in neighborhood)
-        self.assertTrue(add_10_op in neighborhood)
-        self.assertTrue(adaptive_avg_pool2d_9_op in neighborhood)
+        assert len(neighborhood) == 3
+        assert starting_op in neighborhood
+        assert add_10_op in neighborhood
+        assert adaptive_avg_pool2d_9_op in neighborhood
 
-
+    @pytest.mark.cuda
     def test_parse_config_file_defaults_gpu(self):
         """ Test that default quantization parameters are set correctly when using json config file """
         model = SingleResidual()
@@ -454,21 +453,21 @@ class TestQuantsimConfig(unittest.TestCase):
             json.dump(quantsim_config, f)
 
         sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced, config_file='./data/quantsim_config.json',
-                                   input_shapes=(1, 3, 32, 32), in_place=True)
+                                   dummy_input=torch.rand(1, 3, 32, 32).cuda(), in_place=True)
         for name, module in sim.model.named_modules():
             if isinstance(module, QcQuantizeWrapper):
                 # Output of add op is input quantized
                 if name == 'relu3':
-                    self.assertTrue(module.input_quantizer.enabled)
+                    assert module.input_quantizer.enabled
                 else:
-                    self.assertTrue(not module.input_quantizer.enabled)
-                self.assertTrue(module.output_quantizer.enabled)
-                self.assertTrue(not module.input_quantizer.use_symmetric_encodings)
-                self.assertTrue(not module.output_quantizer.use_symmetric_encodings)
+                    assert not module.input_quantizer.enabled
+                assert module.output_quantizers[0].enabled
+                assert not module.input_quantizer.use_symmetric_encodings
+                assert not module.output_quantizers[0].use_symmetric_encodings
                 if module.param_quantizers:
                     for _, param_quantizer in module.param_quantizers.items():
-                        self.assertTrue(not param_quantizer.enabled)
-                        self.assertTrue(param_quantizer.use_symmetric_encodings)
+                        assert not param_quantizer.enabled
+                        assert param_quantizer.use_symmetric_encodings
 
         if os.path.exists('./data/quantsim_config.json'):
             os.remove('./data/quantsim_config.json')

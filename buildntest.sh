@@ -66,6 +66,7 @@ usage() {
   
   echo "${0} [-o <output_folder>]"
   echo "    -b --> build the code"
+  echo "    -p --> generate pip packages"
   echo "    -u --> run unit tests"
   echo "    -v --> run code violation checks (using pylint tool)"
   echo "    -g --> run code coverage checks (using pycov tool)"
@@ -80,7 +81,7 @@ usage() {
 }
 
 
-while getopts "o:abce:im:nghsuvy:" opt;
+while getopts "o:abce:im:npghsuvy:" opt;
    do
       case $opt in
          a)
@@ -94,6 +95,9 @@ while getopts "o:abce:im:nghsuvy:" opt;
              ;;
          g)
              options_string+=" -g"
+             ;;
+         p)
+             options_string+=" -p"
              ;;
          u)
              options_string+=" -u"
@@ -139,19 +143,23 @@ if [ ${dry_run} -eq 0 ]; then
 	set -x
 fi
 
-
-
 timestamp=$(date +%Y-%m-%d_%H-%M-%S)
-
 
 if [ ! -d "../aimet" ] && [ ! -d "../aimet-main" ]; then
    echo -e "ERROR: Not in the correct directory!"
    exit 3
 fi
 
+# Select the docker file based on the build variant
+if [ -n "$AIMET_VARIANT" ] && [[ "$AIMET_VARIANT" == *"cpu"* ]]; then
+    docker_file="${scriptPath}/Jenkins/DockerfileCPU"
+else
+    docker_file="${scriptPath}/Jenkins/Dockerfile"
+fi
+
 echo -e "Building docker image${loading_symbol} \n"
 docker_image_name="aimet-dev-docker:latest"
-DOCKER_BUILD_CMD="docker build -t ${docker_image_name} -f ${scriptPath}/Jenkins/Dockerfile ."
+DOCKER_BUILD_CMD="docker build -t ${docker_image_name} -f ${docker_file} ."
 if [ $interactive_mode -eq 1 ] && [ $dry_run -eq 1 ]; then
 	echo ${DOCKER_BUILD_CMD}
 	echo
@@ -166,6 +174,11 @@ else
      results_path=${outputRootFolder}/buildntest_results
      docker_container_name=aimet-dev_${USER}
 fi
+
+if [ -n "$AIMET_VARIANT" ]; then
+    docker_container_name="${docker_container_name}_${AIMET_VARIANT}"
+fi
+
 rm -rf {results_path} | true
 mkdir -p ${results_path}
 
@@ -181,7 +194,7 @@ else
    docker_add_vol_mount+=${scriptPath}
 fi
 
-#Check if and which version of nvidia docker is present
+# Check if and which version of nvidia docker is present
 set +e
 DOCKER_RUN_PREFIX="docker run"
 dpkg -s nvidia-container-toolkit > /dev/null 2>&1
@@ -190,14 +203,18 @@ dpkg -s nvidia-docker > /dev/null 2>&1
 NVIDIA_DOCKER_RC=$?
 set -e
 
-if [ $NVIDIA_CONTAINER_TOOKIT_RC -eq 0 ]
-then
+if [ -n "$AIMET_VARIANT" ] && [[ "$AIMET_VARIANT" == *"cpu"* ]]; then
+    echo "Running docker in CPU mode..."
+    DOCKER_RUN_PREFIX="docker run"
+elif [ $NVIDIA_CONTAINER_TOOKIT_RC -eq 0 ]; then
+    echo "Running docker in GPU mode using nvidia-container-toolkit..."
     DOCKER_RUN_PREFIX="docker run --gpus all"
-elif [ $NVIDIA_DOCKER_RC -eq 0 ]
-then
+elif [ $NVIDIA_DOCKER_RC -eq 0 ]; then
+    echo "Running docker in GPU mode using nvidia-docker..."
     DOCKER_RUN_PREFIX="nvidia-docker run"
 else
-    echo "WARNING: No nvidia support detected! Unit tests might fail due to GPU dependencies."
+    echo "ERROR: You requested GPU mode, but no nvidia support was detected!"
+    exit 3
 fi
 
 echo -e "Starting docker container${loading_symbol} \n"

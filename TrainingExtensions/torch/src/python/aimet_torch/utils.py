@@ -37,15 +37,23 @@
 # =============================================================================
 """ Utilities that are used for different AIMET PyTorch features """
 
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Dict
+import os
+import pickle
 import numpy as np
 import torch.nn
 import torch
-
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
+
+import libpymo
 from aimet_common.utils import AimetLogger
+from aimet_common.quantsim import calculate_delta_offset
+from aimet_common.defs import QuantScheme
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Utils)
+
+torch_integer_dtypes = [torch.int, torch.int8, torch.int16, torch.int32, torch.int64]
 
 
 class IterFirstX:
@@ -140,6 +148,61 @@ class ModuleData:
         return inp_data, out_data
 
 
+class CachedDataset(Dataset):
+    """
+    Cache number of batches from the data loader at given path location and
+    provide interface to fetch single batch of model inputs.
+    """
+    def __init__(self, data_loader: DataLoader, num_batches: int, path: str):
+        """
+        :param data_loader: Data loader
+        :param num_batches: Number of batches to fetch from data loader
+        :param path: Path to save model inputs
+        """
+        self._data_loader = data_loader
+        self._num_batches = num_batches
+        self._path = path
+
+        self._cache_model_inputs()
+
+    def __len__(self):
+        return self._num_batches
+
+    def __getitem__(self, index: int):
+        path = os.path.join(self._path, 'model_inputs_' + str(index))
+
+        with open(path, 'rb') as file:
+            batch = pickle.load(file)
+
+        return batch
+
+    def _cache_model_inputs(self):
+        """
+        Function to cache number of batches individually in separate file at provided path location
+        """
+        if not os.path.exists(self._path):
+            os.makedirs(self._path)
+
+        iterator = iter(self._data_loader)
+
+        for batch_index in range(self._num_batches):
+            try:
+                batch = next(iterator)
+
+                # batch is of shape (model_inputs, labels)
+                if isinstance(batch, (tuple, list)):
+                    batch, _ = batch
+
+                path = os.path.join(self._path, 'model_inputs_' + str(batch_index))
+                with open(path, 'wb') as file:
+                    pickle.dump(batch, file)
+
+            except StopIteration:
+                raise ValueError('Can not fetch {} batches from data loader.'.format(self._num_batches))
+
+        logger.info('Caching %d batches from data loader at path location: %s', self._num_batches, self._path)
+
+
 def run_hook_for_layers(model: torch.nn.Module, input_shapes: Union[Tuple, List[Tuple]], hook,
                         module_type_for_attaching_hook=None, leaf_node_only=True):
     """
@@ -172,6 +235,46 @@ def run_hook_for_layers(model: torch.nn.Module, input_shapes: Union[Tuple, List[
     dummy_tensors = [tensor.to(device) for tensor in dummy_tensors]
     with torch.no_grad():
         _ = model(*dummy_tensors)
+
+    # --------------------------
+    # Remove all hooks we added
+    # --------------------------
+    for h in hooks:
+        h.remove()
+
+
+def run_hook_for_layers_with_given_input(model: torch.nn.Module, input_tensor: Union[torch.Tensor, Tuple],
+                                         hook, module_type_for_attaching_hook=None, leaf_node_only=True):
+    """
+    Register the given hook function for all layers in the model
+    :param model: Model
+    :param input_tensor: Input tensor to the model. If more than one model inputs, use a tuple
+    :param hook: Hook function to register
+    :param module_type_for_attaching_hook: Tuple of torch.nn module types for which hook has to be attached
+    :param leaf_node_only: Set to False if all modules are required
+    :return: None
+    """
+
+    # ------------------------
+    # Register hook function
+    # ------------------------
+    hooks = []
+    # All leaf modules
+    modules = [module for module in model.modules() if not leaf_node_only or is_leaf_module(module)]
+    if module_type_for_attaching_hook:
+        # if needed, filter by module types specified by caller
+        modules = [module for module in modules if isinstance(module, module_type_for_attaching_hook)]
+    for module in modules:
+        hooks.append(module.register_forward_hook(hook))
+
+    # ------------------------------------------------
+    # Run forward pass to execute the hook functions
+    # ------------------------------------------------
+    with torch.no_grad():
+        if isinstance(input_tensor, (list, tuple)):
+            _ = model(*input_tensor)
+        else:
+            _ = model(input_tensor)
 
     # --------------------------
     # Remove all hooks we added
@@ -315,11 +418,11 @@ def get_one_positions_in_binary_mask(mask):
     return mask_one_positions
 
 
-def get_ordered_list_of_modules(model: torch.nn.Module, input_shapes: Union[Tuple, List[Tuple]]) -> List:
+def get_ordered_list_of_modules(model: torch.nn.Module, dummy_input: Union[torch.Tensor, Tuple]) -> List:
     """
     Finds order of nodes in graph
     :param model: model
-    :param input_shapes: input shape to model (can be one or multiple inputs)
+    :param dummy_input: Dummy input to the model. Used to parse model graph.
     :return: List of names in graph in order
     """
     def _hook_to_collect_name_of_module(module, _, __):
@@ -330,19 +433,19 @@ def get_ordered_list_of_modules(model: torch.nn.Module, input_shapes: Union[Tupl
             if module is module_ref:
                 list_modules.append([name, module])
     list_modules = []
-    run_hook_for_layers(model, input_shapes, hook=_hook_to_collect_name_of_module)
+    run_hook_for_layers_with_given_input(model, dummy_input, hook=_hook_to_collect_name_of_module)
 
     return list_modules
 
 
-def get_ordered_list_of_conv_modules(model: torch.nn.Module, input_shapes: Union[Tuple, List[Tuple]]) -> List:
+def get_ordered_list_of_conv_modules(model: torch.nn.Module, dummy_input: Union[torch.Tensor, Tuple]) -> List:
     """
     Finds order of nodes in graph
     :param model: model
-    :param input_shapes: input shape to model (can be one or multiple inputs)
+    :param dummy_input: Dummy input to the model. Used to parse model graph.
     :return: List of names in graph in order
     """
-    module_list = get_ordered_list_of_modules(model, input_shapes)
+    module_list = get_ordered_list_of_modules(model, dummy_input)
     module_list = [[name, module] for name, module in module_list if isinstance(module, (torch.nn.Conv2d,
                                                                                          torch.nn.ConvTranspose2d))]
     return module_list
@@ -392,10 +495,12 @@ def replace_modules_with_instances_of_new_type(model: torch.nn.Module, modules_t
             replace_modules_with_instances_of_new_type(module_ref, modules_to_replace_list, new_type)
 
 
-def create_rand_tensors_given_shapes(input_shape: Union[Tuple, List[Tuple]]) -> List[torch.Tensor]:
+def create_rand_tensors_given_shapes(input_shape: Union[Tuple, List[Tuple]], device: torch.device = None) \
+        -> List[torch.Tensor]:
     """
     Given shapes of some tensors, create one or more random tensors and return them as a list of tensors
     :param input_shape: Shapes of tensors to create
+    :param device: Device to create tensors on
     :return: Created list of tensors
     """
     if isinstance(input_shape, List):
@@ -405,7 +510,10 @@ def create_rand_tensors_given_shapes(input_shape: Union[Tuple, List[Tuple]]) -> 
 
     rand_tensors = []
     for shape in input_shapes:
-        rand_tensors.append(torch.rand(shape))
+        if device is not None:
+            rand_tensors.append(torch.rand(shape).to(device))
+        else:
+            rand_tensors.append(torch.rand(shape))
 
     return rand_tensors
 
@@ -418,17 +526,21 @@ def get_ordered_lists_of_conv_fc(model: torch.nn.Module, input_shapes: Tuple) ->
     :return: List of names in graph in order
     """
 
-    module_list = get_ordered_list_of_modules(model, input_shapes)
+    device = get_device(model)
+    dummy_input = create_rand_tensors_given_shapes(input_shapes)
+    dummy_input = [tensor.to(device) for tensor in dummy_input]
+    module_list = get_ordered_list_of_modules(model, dummy_input)
     module_list = [[name, module] for name, module in module_list if
                    isinstance(module, (torch.nn.Conv2d, torch.nn.Linear, torch.nn.ConvTranspose2d))]
     return module_list
 
 
-def get_reused_modules(model: torch.nn.Module, input_shapes: Tuple) -> List[Tuple[str, torch.nn.Module]]:
+def get_reused_modules(model: torch.nn.Module, model_input: Union[torch.Tensor, Tuple]) -> \
+        List[Tuple[str, torch.nn.Module]]:
     """
     Identify modules which are used more than once in the model
     :param model: Model to check for modules used more than once
-    :param input_shapes: Input shapes of the model
+    :param model_input: Input to the model
     :return: List of tuples of name and module for modules in the model which are used more than once
     """
     module_set = set()
@@ -445,7 +557,7 @@ def get_reused_modules(model: torch.nn.Module, input_shapes: Tuple) -> List[Tupl
         else:
             module_set.add(curr_module)
 
-    run_hook_for_layers(model, input_shapes, forward_hook)
+    run_hook_for_layers_with_given_input(model, model_input, forward_hook)
 
     reused_modules_list = []
     for name, module in model.named_modules():
@@ -457,6 +569,7 @@ def get_reused_modules(model: torch.nn.Module, input_shapes: Tuple) -> List[Tupl
 def change_tensor_device_placement(tensor_data: Union[torch.tensor, List, Tuple], device: torch.device):
     """
     Change the tensor_data's device placement
+
     :param tensor_data: torch.tensor , list of torch.tensors, or tuple of torch.tensors
     :param device: device information
     :return: tensor_data with modified device placement
@@ -480,3 +593,86 @@ def change_tensor_device_placement(tensor_data: Union[torch.tensor, List, Tuple]
             tensor_data[index] = change_tensor_device_placement(item, device=device)
 
     return tensor_data
+
+
+def find_num_output_tensors_per_module(model: torch.nn.Module, input_tensor) -> Dict:
+    """
+    Returns a map of module -> number of output tensors, for all the children modules of the
+    provided module
+
+    :param model: Torch module to find children modules for
+    :param input_tensor: Input tensor to use to run forward pass for the model. If model needs more than one input
+                         tensor, pass a tuple
+    :return: map of module -> number of output tensors
+    """
+
+    num_outputs_map = {}
+
+    def record_num_outputs(module, _, outputs):
+        num_outputs_map[module] = len(outputs)
+
+    run_hook_for_layers_with_given_input(model, input_tensor, record_num_outputs)
+    return num_outputs_map
+
+
+def create_encoding_from_dict(encoding_dict: dict) -> (libpymo.TfEncoding, bool):
+    """
+    Create encoding object from encoding dictionary
+    :param encoding_dict: Dictionary containing encodings
+    :return: Encoding object, is_symmetric
+    """
+    encoding = libpymo.TfEncoding()
+    encoding.bw = encoding_dict.get('bitwidth')
+    encoding.max = encoding_dict.get('max')
+    encoding.min = encoding_dict.get('min')
+    encoding.delta = encoding_dict.get('scale')
+    encoding.offset = encoding_dict.get('offset')
+    is_symmetric = eval(encoding_dict.get('is_symmetric'))  # pylint: disable=eval-used
+    return encoding, is_symmetric
+
+
+def create_encoding_dict(encoding: libpymo.TfEncoding, is_symmetric: bool) -> Union[Dict, None]:
+    """
+    Create encoding dictionary from encoding object
+    :param encoding: Encoding object
+    :param is_symmetric: Symmetric vs asymmetric boolean
+    :return: Encoding Dictionary
+    """
+    if encoding:
+        encoding_min, encoding_max, bw = encoding.min, encoding.max, encoding.bw
+        scale, offset = calculate_delta_offset(encoding_min, encoding_max, bw)
+        return {'min': encoding_min,
+                'max': encoding_max,
+                'scale': scale,
+                'offset': offset,
+                'bitwidth': bw,
+                'is_symmetric': str(is_symmetric)}
+    return None
+
+
+def compute_encoding_for_given_bitwidth(data: np.ndarray, bitwidth: int, quant_scheme: QuantScheme,
+                                        is_symmetric: bool) -> Dict:
+    """
+    Return encoding dictionary for given bitwidth
+    :param data: Numpy data
+    :param bitwidth: bitwidth (4-31) to use for quantizing data
+    :param quant_scheme: Quantization scheme
+    :param is_symmetric: True if symmetric encodings is used, False otherwise
+    :return: Encoding Dictionary
+    """
+    # Create Encodings Analyzer and collect statistical data to compute encodings
+    # Since the data is numpy array and on CPU memory, useCuda is False
+    encoding_analyzer = libpymo.EncodingAnalyzerForPython(quant_scheme)
+    encoding_analyzer.updateStats(data, False)
+
+    encoding, is_encoding_valid = encoding_analyzer.computeEncoding(bitwidth, is_symmetric)
+
+    if is_encoding_valid:
+        return {'min': encoding.min,
+                'max': encoding.max,
+                'scale': encoding.delta,
+                'offset': encoding.offset,
+                'bitwidth': encoding.bw,
+                'is_symmetric': str(is_symmetric)}
+
+    return {}
